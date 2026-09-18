@@ -2,7 +2,6 @@
 [![License: WTFPL](https://img.shields.io/badge/license-WTFPL_2.0-lightgrey.svg?style=plastic)](https://www.wtfpl.net/)
 ![Hack The Planet](https://img.shields.io/badge/hack-the--planet-black?style=plastic\&logo=Debian\&logoColor=white)
 ![Built With Love](https://img.shields.io/badge/built%20with-%E2%9D%A4%20by%20DeuZa-red?style=plastic)
-
 ![shellcheck](https://img.shields.io/badge/shellcheck-clean-brightgreen?style=plastic)
 
 ![GitHub release](https://img.shields.io/github/v/release/deuza/tarsnap-tools?label=release&style=plastic)
@@ -16,7 +15,8 @@
 
 Tarsnap Tools est une suite d'utilitaires pour Tarsnap utilisée par l'auteur au quotidien.
 
-Sauvegarde [Tarsnap](https://www.tarsnap.com/), puis rotation grand-père/père/fils. Écrit pour Debian, en `sh` strictement POSIX, sans dépendance à `bash`.
+Sauvegarde [Tarsnap](https://www.tarsnap.com/), puis rotation grand-père/père/fils.   
+Ecrit pour Debian, en `sh` strictement POSIX, sans dépendance à `bash`.
 
 Le pilier est `tarsnap-backup.sh` qui s'occupe de faire vos sauvegardes, une fois configuré plus besoin d'y toucher.  
 Il prépare ce qui doit l'être, crée une archive datée, puis purge les anciennes selon un schéma de rétention à trois paliers.
