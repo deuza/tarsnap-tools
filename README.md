@@ -15,8 +15,8 @@
 
 Tarsnap Tools est une suite d'utilitaires pour Tarsnap utilisée par l'auteur au quotidien.
 
-Sauvegarde [Tarsnap](https://www.tarsnap.com/), puis rotation grand-père/père/fils.   
-Ecrit pour Debian, en `sh` strictement POSIX, sans dépendance à `bash`.
+Il utilise l'outil de sauvegarde [Tarsnap](https://www.tarsnap.com/), puis rotation grand-père/père/fils.   
+Il est écrit pour Debian, en `sh` strictement POSIX, sans dépendance à `bash` mais avec des dépendances à Debian.
 
 Le pilier est `tarsnap-backup.sh` qui s'occupe de faire vos sauvegardes, une fois configuré plus besoin d'y toucher.  
 Il prépare ce qui doit l'être, crée une archive datée, puis purge les anciennes selon un schéma de rétention à trois paliers.
@@ -31,7 +31,9 @@ Trois outils l'accompagnent (aucun ne créant ni ne supprimant la moindre archiv
 | `tarsnap-stats.sh` | tailles, déduplication et coût de stockage |
 
 Ces scripts ont été testés et développés avec la version 1.0.4 de Tarsnap sous Debian Trixie et sont utilisés quotidiennement par l'auteur.   
-Ils sont commentés un maximum pour qu'ils puissent être compréhensibles, modifiés, adaptés etc.
+Ils sont abondemment commentés pour pouvoir être compréhensibles, modifiés, adaptés etc.
+
+**NOTE : Prenez le temps de lire tranquillement ce README en entier avant de vous lancer dans l'installation. L'utilisation et la configuration sont relativement simples mais demandent une compréhension de ce que font les différents outils.**
 
 ## Sommaire
 
