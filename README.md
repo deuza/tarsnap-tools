@@ -17,7 +17,7 @@ Tarsnap Tools est une suite d'utilitaires pour Tarsnap utilisée par l'auteur au
 Il utilise l'outil de sauvegarde [Tarsnap](https://www.tarsnap.com/), puis rotation grand-père/père/fils.   
 Il est écrit pour Debian, en `sh` strictement POSIX, sans dépendance à `bash` mais avec des dépendances à Debian.
 
-Le pilier est `tarsnap-backup.sh` qui s'occupe de faire vos sauvegardes, une fois configuré plus besoin d'y toucher.  
+Le script principal est `tarsnap-backup.sh` qui s'occupe de faire vos sauvegardes, une fois configuré plus besoin d'y toucher.  
 Il prépare ce qui doit l'être, crée une archive datée, puis purge les anciennes selon un schéma de rétention à trois paliers.
 
 Trois outils l'accompagnent (aucun ne créant ni ne supprimant la moindre archive) :
@@ -69,7 +69,7 @@ Le *pire* cas possible est donc "les anciennes archives s'accumulent", mais jama
 
 ### Le principe
 
-Grand-père/Père/Fils, est un schéma de rotation de bandes magnétiques, antérieur de plusieurs décennies aux sauvegardes en ligne (comme moi :).   
+Grand-père/Père/Fils `(GFS)`, est un schéma de rotation de bandes magnétiques, antérieur de plusieurs décennies aux sauvegardes en ligne (comme moi :).   
 L'idée : plus une sauvegarde est ancienne, moins on a besoin de granularité : on conserve donc toutes les sauvegardes récentes, puis une par semaine, puis une par mois.
 
 [Fiche Wikipédia](https://en.wikipedia.org/wiki/Backup_rotation_scheme#Grandfather-father-son)
