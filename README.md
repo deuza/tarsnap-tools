@@ -5,8 +5,12 @@
 ![shellcheck](https://img.shields.io/badge/shellcheck-clean-brightgreen?style=plastic)
 
 ![GitHub release](https://img.shields.io/github/v/release/deuza/tarsnap-tools?label=release&style=plastic)
+<<<<<<< HEAD
 ![GitHub Release Date](https://img.shields.io/github/release-date/deuza/tarsnap-tools&style=plastic)
 [![GitHub last commit](https://img.shields.io/github/last-commit/deuza/tarsnap-tools?style=plastic)](https://github.com/deuza/tarsnap-tools/commits/main)
+=======
+[![GitHub last commit](https://img.shields.io/github/last-commit/deuza/tarsnap-tools?style=plastic)](https://github.com/deuza/tarsnap-backup/commits/main)
+>>>>>>> 72c6461 (Fix README)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/t/deuza/tarsnap-tools?style=plastic)
 ![GitHub code size in bytes](https://img.shields.io/github/languages/code-size/deuza/tarsnap-tools?style=plastic)
 
