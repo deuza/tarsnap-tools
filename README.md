@@ -1,5 +1,4 @@
 [![License: CC0](https://img.shields.io/badge/license-CC0_1.0-lightgrey.svg?style=plastic)](https://creativecommons.org/publicdomain/zero/1.0/)
-[![License: WTFPL](https://img.shields.io/badge/license-WTFPL_2.0-lightgrey.svg?style=plastic)](https://www.wtfpl.net/)
 ![Hack The Planet](https://img.shields.io/badge/hack-the--planet-black?style=plastic\&logo=Debian\&logoColor=white)
 ![Built With Love](https://img.shields.io/badge/built%20with-%E2%9D%A4%20by%20DeuZa-red?style=plastic)
 
@@ -650,7 +649,6 @@ Do not put it in `cron` for all that: `--list-archives` downloads and decrypts t
 This script has its own repository, [github.com/deuza/tarsnap-stats](https://github.com/deuza/tarsnap-stats), where its full documentation is maintained: options, exit codes, and how to check each figure by hand against the raw output of Tarsnap.
 
 It is also listed on [Tarsnap's helper scripts page](https://www.tarsnap.com/helper-scripts.html), in the *Other Tarsnap-related tools* section.  
-Note: it is released under `CC0` only, and not under the `CC0`/`WTFPL` dual licensing of the rest of this repository.
 
 ## Design guarantees
 
