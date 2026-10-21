@@ -740,7 +740,7 @@ The restored file will therefore end up in `/tmp/restore/etc/fstab`: it will **N
 
 `CC0 1.0 Universal` -- Public Domain -- [LICENSE](LICENSE).
 
-With one exception: `tarsnap-stats.sh`, which comes from [its own repository](https://github.com/deuza/tarsnap-stats), is released under `CC0` only, but do whatever you want with it :D
+`tarsnap-stats.sh`, which comes from [its own repository](https://github.com/deuza/tarsnap-stats)
 
 
 <p align="center">With ❤️ by <a href="https://github.com/deuza">DeuZa</a></p>
