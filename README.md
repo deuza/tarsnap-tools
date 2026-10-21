@@ -88,7 +88,7 @@ The three windows **follow one another** instead of overlapping. Each tier takes
 The total coverage is therefore `DAILY` days **plus** `WEEKLY` weeks **plus** `MONTHLY` months, i.e. nearly four and a half years with the shipped values.
 
 The other possible reading, where the three windows would be counted from now rather than one after the other, was not retained.  
-It requires the user to respect the invariant `DAILY < WEEKLY × 7 < MONTHLY × 30`, otherwise a tier silently becomes unreachable.
+It requires the user to respect the invariant `DAILY < WEEKLY*7 < MONTHLY*30`, otherwise a tier silently becomes unreachable.
 
 With `DAILY=90` and `WEEKLY=12`, the 84 days of the weekly window would fit entirely within the 90 days of the daily window, and the father tier would never keep anything, without the slightest error message. Cumulative windows make this invariant structural: there is nothing left to check.
 

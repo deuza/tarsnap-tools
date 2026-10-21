@@ -2,23 +2,28 @@
 #
 # rotation-check.sh
 #
-# Harnais de diagnostic pour tarsnap-backup.sh. Ne touche NI tarsnap, NI le réseau, NI la moindre archive : 
-# il rejoue la seule logique de décision de la rotation, à la ligne près.
+# Diagnostic harness for tarsnap-backup.sh. It touches NEITHER tarsnap, NOR
+# the network, NOR any archive: it replays nothing but the decision logic
+# of the rotation, line for line.
 #
-# Deux modes :
+# Two modes:
 #
-#   - simulation (par défaut)
-#       Génère un historique d'archives quotidiennes sur N jours et compte ce que chaque palier retiendrait.  
-#       Indispensable quand la machine ne tourne que depuis quelques semaines : 
-#       un --dry-run réel ne prouve rien tant que toutes les archives sont dans la fenêtre quotidienne.
+#   - simulation (default)
+#       Generates a history of daily archives over N days and counts what
+#       each tier would keep.
+#       Essential when the machine has only been running for a few weeks:
+#       a real --dry-run proves nothing as long as all the archives fall
+#       within the daily window.
 #
-#   - rejeu (-l)
-#       Rejoue la décision sur une vraie liste d'archives, lue dans un fichier ou sur l'entrée standard :
+#   - replay (-l)
+#       Replays the decision against a real list of archives, read from a
+#       file or from standard input:
 #           tarsnap --list-archives | ./rotation-check.sh -l -
 #
-# Les valeurs de rétention sont lues directement dans tarsnap-backup.sh
+# The retention values are read directly from tarsnap-backup.sh.
 #
-# Les options permettent de comparer un scénario sans rien y toucher.
+# The options make it possible to compare a scenario without changing
+# anything in that file.
 
 set -euf
 
@@ -26,17 +31,20 @@ DATE_BIN="/usr/bin/date"
 UNAME_BIN="/usr/bin/uname"
 SED_BIN="/usr/bin/sed"
 
-# --- Emplacement de tarsnap-backup.sh ---
-# Ordre de recherche : le chemin installé ci-dessous, puis, à défaut, un tarsnap-backup.sh voisin dans le répertoire du harnais, ce qui couvre le cas du dépôt fraîchement cloné. 
-# L'option -f court-circuite les deux.
+# --- Location of tarsnap-backup.sh ---
+# Search order: the installed path below, then, failing that, a
+# tarsnap-backup.sh next to the harness, in its own directory, which covers
+# the case of a freshly cloned repository.
+# The -f option bypasses both.
 
 BACKUP_SCRIPT_INSTALLED="/usr/local/sbin/tarsnap-backup.sh"
 
-DAYS=1825         # horizon simulé, 5 ans
-LISTFILE=""       # non vide = mode rejeu
-BACKUP_SCRIPT=""  # non vide = chemin imposé par -f
+DAYS=1825         # simulated horizon, 5 years
+LISTFILE=""       # non-empty = replay mode
+BACKUP_SCRIPT=""  # non-empty = path forced by -f
 
-# Surcharges de ligne de commande. Vide = on garde la valeur lue dans le script testé.
+# Command-line overrides. Empty = keep the value read from the script under
+# test.
 OPT_DAILY=""
 OPT_WEEKLY=""
 OPT_MONTHLY=""
@@ -45,27 +53,27 @@ OPT_DOM=""
 
 usage() {
     cat >&2 <<EOF
-usage: ${0##*/} [-D jours] [-f script] [-d DAILY] [-w WEEKLY] [-m MONTHLY]
-                [-o DOW] [-M DOM] [-l fichier|-] [-h]
+usage: ${0##*/} [-D days] [-f script] [-d DAILY] [-w WEEKLY] [-m MONTHLY]
+                [-o DOW] [-M DOM] [-l file|-] [-h]
 
-  -D jours    horizon de la simulation (defaut $DAYS)
-  -f script   chemin de tarsnap-backup.sh, ou lire la configuration
-  -d DAILY    surcharge la fenetre quotidienne, en jours
-  -w WEEKLY   surcharge la fenetre hebdomadaire, en semaines
-  -m MONTHLY  surcharge la fenetre mensuelle, en mois
-  -o DOW      surcharge le jour de semaine conserve, 0=dimanche
-  -M DOM      surcharge le jour du mois conserve
-  -l fichier  rejeu sur une vraie liste d archives, "-" pour stdin
-  -h          affiche cette aide
+  -D days     simulation horizon (default $DAYS)
+  -f script   path of the tarsnap-backup.sh to read the configuration from
+  -d DAILY    override the daily window, in days
+  -w WEEKLY   override the weekly window, in weeks
+  -m MONTHLY  override the monthly window, in months
+  -o DOW      override the day of the week kept, 0=Sunday
+  -M DOM      override the day of the month kept
+  -l file     replay against a real list of archives, "-" for stdin
+  -h          display this help
 
-Sans surcharge, les cinq valeurs de retention sont lues dans tarsnap-backup.sh. 
-Recherche : $BACKUP_SCRIPT_INSTALLED, puis le repertoire de ce script.
+Without overrides, the five retention values are read from tarsnap-backup.sh.
+Search order: $BACKUP_SCRIPT_INSTALLED, then this script's directory.
 EOF
     exit "${1:-1}"
 }
 
 die() {
-    printf 'ERREUR: %s\n' "$*" >&2
+    printf 'ERROR: %s\n' "$*" >&2
     exit 1
 }
 
@@ -84,10 +92,10 @@ while getopts "D:f:d:w:m:o:M:l:h" opt; do
     esac
 done
 
-# --- Résolution du script à lire ---
+# --- Resolving the script to read ---
 if [ -z "$BACKUP_SCRIPT" ]; then
-    # ${0%/*} rend le répertoire, sauf si $0 ne contient aucun slash, auquel
-    # cas il rend $0 lui-même : d'où le case plutôt qu'un dirname.
+    # ${0%/*} yields the directory, unless $0 contains no slash, in which
+    # case it yields $0 itself: hence the case, rather than a dirname.
     case "$0" in
         */*) HERE=${0%/*} ;;
         *)   HERE="." ;;
@@ -97,20 +105,23 @@ if [ -z "$BACKUP_SCRIPT" ]; then
     elif [ -r "$HERE/tarsnap-backup.sh" ]; then
         BACKUP_SCRIPT="$HERE/tarsnap-backup.sh"
     else
-        die "tarsnap-backup.sh introuvable dans $BACKUP_SCRIPT_INSTALLED ni dans $HERE, utilisez -f"
+        die "tarsnap-backup.sh found neither in $BACKUP_SCRIPT_INSTALLED nor in $HERE, use -f"
     fi
 fi
-[ -r "$BACKUP_SCRIPT" ] || die "illisible: $BACKUP_SCRIPT"
+[ -r "$BACKUP_SCRIPT" ] || die "not readable: $BACKUP_SCRIPT"
 
-# Lecture d'une valeur entière dans le script testé.
+# Reading an integer value from the script under test.
 #
-# On ne source PAS le fichier : cela déclencherait son analyse d'options, sa prise de verrou, et au bout du compte une vraie sauvegarde. 
-# Un sed ancré suffit. Il s'arrête au premier match et valide au passage que la valeur est bien un entier. 
-# L'ancrage sur "^NOM=" écarte les homonymes tels que DAILY_SEC, qui ne commencent pas par "DAILY=".
+# The file is NOT sourced: that would trigger its option parsing, its lock
+# and, in the end, a real backup.
+# An anchored sed is enough. It stops at the first match and, along the
+# way, checks that the value really is an integer.
+# Anchoring on "^NAME=" rules out namesakes such as DAILY_SEC, which do not
+# start with "DAILY=".
 
 read_value() {
     _v=$("$SED_BIN" -n "/^$1=/{s/^$1=\([0-9][0-9]*\).*/\1/p;q;}" "$BACKUP_SCRIPT")
-    [ -n "$_v" ] || die "valeur $1 introuvable ou non numérique dans $BACKUP_SCRIPT"
+    [ -n "$_v" ] || die "value $1 not found or not numeric in $BACKUP_SCRIPT"
     printf '%s\n' "$_v"
 }
 
@@ -120,18 +131,22 @@ MONTHLY=$(read_value MONTHLY)
 DOW=$(read_value DOW)
 DOM=$(read_value DOM)
 
-# Les surcharges viennent après la lecture, pour pouvoir comparer un scénario
-# à la configuration réelle sans toucher au script. Des if plutôt que des
-# "[ ] && x=y" : sous set -e, un test faux en fin de commande tuerait le
-# script.
+# The overrides come after the reading, so that a scenario can be compared
+# with the real configuration without touching the script.
+# if statements rather than "[ ] && x=y": under set -e, a false test at the
+# head of an && list does not stop the script by itself, but the list still
+# returns a non-zero status. As the last command of a function, that status
+# would kill the script at the call site; as the last command of the
+# script, it would become its exit code. An if without else whose test
+# fails returns 0, wherever the line ends up.
 if [ -n "$OPT_DAILY" ];   then DAILY=$OPT_DAILY;     fi
 if [ -n "$OPT_WEEKLY" ];  then WEEKLY=$OPT_WEEKLY;   fi
 if [ -n "$OPT_MONTHLY" ]; then MONTHLY=$OPT_MONTHLY; fi
 if [ -n "$OPT_DOW" ];     then DOW=$OPT_DOW;         fi
 if [ -n "$OPT_DOM" ];     then DOM=$OPT_DOM;         fi
 
-# Memes calculs que le script teste : fenetres CUMULEES, chaque palier prend
-# le relais la ou le precedent s arrete.
+# Same calculations as the script under test: CUMULATIVE windows, each tier
+# takes over where the previous one stops.
 NOW_UNIX=$("$DATE_BIN" +%s)
 DAILY_SEC=$((DAILY * 86400))
 WEEKLY_SEC=$((DAILY_SEC + WEEKLY * 604800))
@@ -140,46 +155,49 @@ MONTHLY_UNIX=$(($("$DATE_BIN" -d "-${MONTHLY} months" +%s) - WEEKLY_SEC))
 TMP=$(mktemp) || exit 1
 trap 'rm -f "$TMP"' EXIT HUP INT TERM
 
-printf 'tarsnap-backup : controle de coherence de la rotation\n'
-printf -- '-----------------------------------------------------\n'
-printf 'configuration lue dans %s\n\n' "$BACKUP_SCRIPT"
-printf 'quotidien  DAILY=%-4s tout             de %5s a %5s j\n' \
+printf 'tarsnap-backup: rotation consistency check\n'
+printf -- '------------------------------------------\n'
+printf 'configuration read from %s\n\n' "$BACKUP_SCRIPT"
+printf 'daily      DAILY=%-4s all              from %5s to %5s d\n' \
     "$DAILY" 0 "$((DAILY_SEC / 86400))"
-printf 'hebdo      WEEKLY=%-3s DOW=%s            de %5s a %5s j\n' \
+printf 'weekly     WEEKLY=%-3s DOW=%s            from %5s to %5s d\n' \
     "$WEEKLY" "$DOW" "$((DAILY_SEC / 86400))" "$((WEEKLY_SEC / 86400))"
-printf 'mensuel    MONTHLY=%-2s DOM=%-2s           de %5s a %5s j\n\n' \
+printf 'monthly    MONTHLY=%-2s DOM=%-2s           from %5s to %5s d\n\n' \
     "$MONTHLY" "$DOM" "$((WEEKLY_SEC / 86400))" \
     "$(((NOW_UNIX - MONTHLY_UNIX) / 86400))"
 
-# Invariant : chaque palier doit ouvrir une fenetre STRICTEMENT plus large que
-# le precedent, sinon son test est inatteignable et le palier ne sert a rien.
-# En fenetres cumulees l invariant est structurel : chaque borne est calculee
-# a partir de la precedente, un palier ne peut plus etre avale par son voisin.
-# Restent les cas ou un palier est mis a zero, donc desactive de fait.
+# Invariant: each tier must open a window STRICTLY wider than the previous
+# one, otherwise its test is unreachable and the tier is useless.
+# With cumulative windows the invariant is structural: each bound is
+# computed from the previous one, a tier can no longer be swallowed by its
+# neighbour.
+# What remains are the cases where a tier is set to zero, hence disabled in
+# practice.
 ANOMALIE=0
 if [ "$WEEKLY" -lt 1 ]; then
     ANOMALIE=1
-    printf 'ATTENTION: WEEKLY=%s, le palier hebdomadaire est desactive.\n\n' \
+    printf 'WARNING: WEEKLY=%s, the weekly tier is disabled.\n\n' \
         "$WEEKLY"
 fi
 if [ "$MONTHLY_UNIX" -ge "$((NOW_UNIX - WEEKLY_SEC))" ]; then
     ANOMALIE=1
-    printf 'ATTENTION: MONTHLY=%s ne depasse pas la fenetre hebdomadaire,\n' \
+    printf 'WARNING: MONTHLY=%s does not extend beyond the weekly window,\n' \
         "$MONTHLY"
-    printf '           le palier mensuel est desactive.\n\n'
+    printf '         the monthly tier is disabled.\n\n'
 fi
 
-# Decision pour une archive, a partir de son epoch, son jour de semaine et son
-# jour du mois. Ecrit le verdict dans DECISION : fils, pere, gpere ou purge.
+# Decision for one archive, from its epoch, its day of the week and its day
+# of the month. Writes the verdict into DECISION: son, father, gfather or
+# purge.
 decide() {
     _unix=$1; _dow=$2; _dom=$3
     _age=$((NOW_UNIX - _unix))
     if [ "$_age" -lt "$DAILY_SEC" ]; then
-        DECISION=fils
+        DECISION=son
     elif [ "$_dow" -eq "$DOW" ] && [ "$_age" -lt "$WEEKLY_SEC" ]; then
-        DECISION=pere
+        DECISION=father
     elif [ "$_dom" -eq "$DOM" ] && [ "$_unix" -gt "$MONTHLY_UNIX" ]; then
-        DECISION=gpere
+        DECISION=gfather
     else
         DECISION=purge
     fi
@@ -189,7 +207,7 @@ kd=0; kw=0; km=0; del=0; skip=0
 
 if [ -n "$LISTFILE" ]; then
     ###########################################################################
-    # MODE REJEU sur une vraie liste
+    # REPLAY MODE against a real list
     ###########################################################################
     COMPUTER=$("$UNAME_BIN" -n)
     if [ "$LISTFILE" = "-" ]; then
@@ -198,18 +216,18 @@ if [ -n "$LISTFILE" ]; then
         cat "$LISTFILE" > "$TMP"
     fi
 
-    printf 'Rejeu sur la liste reelle, hostname "%s" :\n\n' "$COMPUTER"
+    printf 'Replay against the real list, hostname "%s":\n\n' "$COMPUTER"
 
     while read -r archive; do
         [ -n "$archive" ] || continue
         case "$archive" in
             *.part)
-                printf '  %-32s PARTIELLE, laissee en place\n' "$archive"
+                printf '  %-32s PARTIAL, left in place\n' "$archive"
                 skip=$((skip + 1)); continue ;;
             "${COMPUTER}-"[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]-[0-9][0-9])
                 ;;
             *)
-                printf '  %-32s hors motif, intouchable\n' "$archive"
+                printf '  %-32s outside the pattern, untouchable\n' "$archive"
                 skip=$((skip + 1)); continue ;;
         esac
 
@@ -220,26 +238,26 @@ if [ -n "$LISTFILE" ]; then
         decide "$1" "$2" "$3"
 
         case "$DECISION" in
-            fils)  kd=$((kd + 1));   verdict="CONSERVEE  (fils, quotidien)" ;;
-            pere)  kw=$((kw + 1));   verdict="CONSERVEE  (pere, hebdo)" ;;
-            gpere) km=$((km + 1));   verdict="CONSERVEE  (grand-pere, mensuel)" ;;
-            *)     del=$((del + 1)); verdict="SUPPRIMEE" ;;
+            son)     kd=$((kd + 1));   verdict="KEPT  (son, daily)" ;;
+            father)  kw=$((kw + 1));   verdict="KEPT  (father, weekly)" ;;
+            gfather) km=$((km + 1));   verdict="KEPT  (grandfather, monthly)" ;;
+            *)       del=$((del + 1)); verdict="DELETED" ;;
         esac
         printf '  %-32s %s\n' "$archive" "$verdict"
     done < "$TMP"
     printf '\n'
 else
     ###########################################################################
-    # MODE SIMULATION
+    # SIMULATION MODE
     ###########################################################################
-    printf 'Simulation sur %s jours, une archive par jour...\n' "$DAYS"
+    printf 'Simulation over %s days, one archive per day...\n' "$DAYS"
 
-    # Deux appels a date pour tout l historique, au lieu de quatre par jour :
-    # la version precedente forkait 7300 fois pour 5 ans et donnait
-    # l impression d etre plantee.
-    # Premiere passe : les dates relatives deviennent des AAAA-MM-JJ.
-    # Seconde passe : ces jours deviennent epoch de minuit, jour de semaine et
-    # jour du mois, exactement comme le fait le script teste.
+    # Two calls to date for the whole history, instead of four per day: the
+    # previous version forked 7300 times for 5 years and looked as if it had
+    # hung.
+    # First pass: the relative dates become YYYY-MM-DD.
+    # Second pass: those days become the epoch at midnight, the day of the
+    # week and the day of the month, exactly as the script under test does.
     i=0
     while [ "$i" -lt "$DAYS" ]; do
         printf -- '-%s days\n' "$i"
@@ -249,27 +267,27 @@ else
     while read -r f_unix f_dow f_dom; do
         decide "$f_unix" "$f_dow" "$f_dom"
         case "$DECISION" in
-            fils)  kd=$((kd + 1)) ;;
-            pere)  kw=$((kw + 1)) ;;
-            gpere) km=$((km + 1)) ;;
-            *)     del=$((del + 1)) ;;
+            son)     kd=$((kd + 1)) ;;
+            father)  kw=$((kw + 1)) ;;
+            gfather) km=$((km + 1)) ;;
+            *)       del=$((del + 1)) ;;
         esac
     done < "$TMP"
     printf '\n'
 fi
 
-printf '  fils       (quotidien)  : %s\n' "$kd"
-printf '  pere       (hebdo)      : %s\n' "$kw"
-printf '  grand-pere (mensuel)    : %s\n' "$km"
-printf '  supprimees              : %s\n' "$del"
-[ "$skip" -gt 0 ] && printf '  hors perimetre          : %s\n' "$skip"
+printf '  son         (daily)    : %s\n' "$kd"
+printf '  father      (weekly)   : %s\n' "$kw"
+printf '  grandfather (monthly)  : %s\n' "$km"
+printf '  deleted                : %s\n' "$del"
+[ "$skip" -gt 0 ] && printf '  outside the rotation   : %s\n' "$skip"
 printf '  ----------------------------------\n'
-printf '  conservees au total     : %s\n\n' "$((kd + kw + km))"
+printf '  kept in total          : %s\n\n' "$((kd + kw + km))"
 
 if [ "$kw" -eq 0 ] && [ "$ANOMALIE" -eq 1 ]; then
-    printf 'CONCLUSION: le palier pere ne conserve rien.\n'
+    printf 'CONCLUSION: the father tier keeps nothing.\n'
 fi
 if [ "$ANOMALIE" -eq 0 ] && [ -z "$LISTFILE" ]; then
-    printf 'Les trois paliers sont actifs, la configuration est coherente.\n'
+    printf 'All three tiers are active, the configuration is consistent.\n'
 fi
 exit 0
