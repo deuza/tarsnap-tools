@@ -30,6 +30,10 @@ set -euf
 DATE_BIN="/usr/bin/date"
 UNAME_BIN="/usr/bin/uname"
 SED_BIN="/usr/bin/sed"
+CAT_BIN="/usr/bin/cat"
+MKTEMP_BIN="/usr/bin/mktemp"
+RM_BIN="/usr/bin/rm"
+SORT_BIN="/usr/bin/sort"
 
 # --- Location of tarsnap-backup.sh ---
 # Search order: the installed path below, then, failing that, a
@@ -51,6 +55,10 @@ OPT_MONTHLY=""
 OPT_DOW=""
 OPT_DOM=""
 
+# The only place where a binary is called without its absolute path:
+# usage() can be reached through -h BEFORE the safeguard loop, and a wrong
+# "$CAT_BIN" would make the help fail there instead of displaying it. It is
+# also exactly the idiom used by tarsnap-backup.sh and tarsnap-diff.sh.
 usage() {
     # The continuation line of the synopsis is aligned under the first
     # option, whatever the name the script was installed under: as many
@@ -63,8 +71,8 @@ usage() {
         _rest=${_rest#?}
     done
     cat >&2 <<EOF
-usage: ${0##*/} [-D days] [-f script] [-d DAILY] [-w WEEKLY] [-m MONTHLY]
-$_pad [-o DOW] [-M DOM] [-l file|-] [-h]
+usage: ${0##*/} [-D days] [-f script] [-d DAILY] [-w WEEKLY]
+$_pad [-m MONTHLY] [-o DOW] [-M DOM] [-l file|-] [-h]
 
   -D days     simulation horizon (default $DAYS)
   -f script   path of the tarsnap-backup.sh to read the configuration from
@@ -100,6 +108,14 @@ while getopts "D:f:d:w:m:o:M:l:h" opt; do
         h) usage 0 ;;
         *) usage 1 ;;
     esac
+done
+
+# --- Safeguards ---
+# All the configured binaries must be executable. The check comes after the
+# options, so that -h keeps working even if one of them is missing.
+for bin in "$DATE_BIN" "$UNAME_BIN" "$SED_BIN" "$CAT_BIN" "$MKTEMP_BIN" \
+           "$RM_BIN" "$SORT_BIN"; do
+    [ -x "$bin" ] || die "binary missing or not executable: $bin"
 done
 
 # --- Resolving the script to read ---
@@ -162,8 +178,8 @@ DAILY_SEC=$((DAILY * 86400))
 WEEKLY_SEC=$((DAILY_SEC + WEEKLY * 604800))
 MONTHLY_UNIX=$(($("$DATE_BIN" -d "-${MONTHLY} months" +%s) - WEEKLY_SEC))
 
-TMP=$(mktemp) || exit 1
-trap 'rm -f "$TMP"' EXIT HUP INT TERM
+TMP=$("$MKTEMP_BIN") || exit 1
+trap '"$RM_BIN" -f "$TMP"' EXIT HUP INT TERM
 
 printf 'tarsnap-backup: rotation consistency check\n'
 printf -- '------------------------------------------\n'
@@ -213,6 +229,17 @@ decide() {
     fi
 }
 
+# Replay mode: prints the name of an archive, indented by two spaces and
+# padded to NAME_WIDTH, then its verdict. The padding is counted with
+# parameter expansions, as in usage(), so the printf format stays constant.
+print_verdict() {
+    _name=$1
+    while [ "${#_name}" -lt "$NAME_WIDTH" ]; do
+        _name="$_name "
+    done
+    printf '  %s %s\n' "$_name" "$2"
+}
+
 kd=0; kw=0; km=0; del=0; skip=0
 
 if [ -n "$LISTFILE" ]; then
@@ -221,10 +248,25 @@ if [ -n "$LISTFILE" ]; then
     ###########################################################################
     COMPUTER=$("$UNAME_BIN" -n)
     if [ "$LISTFILE" = "-" ]; then
-        cat > "$TMP"
+        "$CAT_BIN" > "$TMP"
     else
-        cat "$LISTFILE" > "$TMP"
+        "$CAT_BIN" "$LISTFILE" > "$TMP"
     fi
+
+    # tarsnap lists the archives in no particular order. Sorted by name in
+    # the C locale, they come out grouped by host and, within each host, in
+    # chronological order, since the timestamp has a fixed width.
+    LC_ALL=C "$SORT_BIN" -o "$TMP" "$TMP"
+
+    # Width of the name column: at least 32 characters, widened to the
+    # longest name of the list, so that a long snapshot name does not shift
+    # the verdicts.
+    NAME_WIDTH=32
+    while read -r archive; do
+        if [ "${#archive}" -gt "$NAME_WIDTH" ]; then
+            NAME_WIDTH=${#archive}
+        fi
+    done < "$TMP"
 
     printf 'Replay against the real list, hostname "%s":\n\n' "$COMPUTER"
 
@@ -232,12 +274,12 @@ if [ -n "$LISTFILE" ]; then
         [ -n "$archive" ] || continue
         case "$archive" in
             *.part)
-                printf '  %-32s PARTIAL, left in place\n' "$archive"
+                print_verdict "$archive" "PARTIAL, left in place"
                 skip=$((skip + 1)); continue ;;
             "${COMPUTER}-"[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]-[0-9][0-9])
                 ;;
             *)
-                printf '  %-32s outside the pattern, untouchable\n' "$archive"
+                print_verdict "$archive" "outside the pattern, untouchable"
                 skip=$((skip + 1)); continue ;;
         esac
 
@@ -253,7 +295,7 @@ if [ -n "$LISTFILE" ]; then
             gfather) km=$((km + 1));   verdict="KEPT  (grandfather, monthly)" ;;
             *)       del=$((del + 1)); verdict="DELETED" ;;
         esac
-        printf '  %-32s %s\n' "$archive" "$verdict"
+        print_verdict "$archive" "$verdict"
     done < "$TMP"
     printf '\n'
 else
