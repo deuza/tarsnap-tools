@@ -738,10 +738,9 @@ The restored file will therefore end up in `/tmp/restore/etc/fstab`: it will **N
 
 ## License
 
-[![CC0](https://mirrors.creativecommons.org/presskit/buttons/88x31/svg/cc-zero.svg)](https://creativecommons.org/publicdomain/zero/1.0/)    [![WTFPL](http://www.wtfpl.net/wp-content/uploads/2012/12/wtfpl-badge-1.png)](http://www.wtfpl.net/)
+[![CC0](https://mirrors.creativecommons.org/presskit/buttons/88x31/svg/cc-zero.svg)](https://creativecommons.org/publicdomain/zero/1.0/)
 
 `CC0 1.0 Universal` -- Public Domain -- [LICENSE](LICENSE).
-`WTFPL` -- Do What The Fuck You Want To Public License, version 2 -- [LICENSE-WTFPL](LICENSE-WTFPL).
 
 With one exception: `tarsnap-stats.sh`, which comes from [its own repository](https://github.com/deuza/tarsnap-stats), is released under `CC0` only, but do whatever you want with it :D
 
