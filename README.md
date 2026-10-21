@@ -170,7 +170,8 @@ chmod 0700 /usr/local/sbin/tarsnap-backup.sh
 The script runs as root and reads the Tarsnap key: 0700 and nothing more.
 
 The other three scripts are optional extras and do not need to be installed in `/usr/local/sbin/`.  
-Make them executable and run them from the cloned repository:
+Git keeps them executable, mode `100755` in the repository: run them straight from the cloned repository, without any `chmod`.  
+Only if you fetched them some other way, a raw download for instance, restore the executable bit:
 
 ```sh
 chmod +x rotation-check.sh tarsnap-diff.sh tarsnap-stats.sh
@@ -473,7 +474,7 @@ Two different sizes imply two different contents: the case is settled for free, 
 Two matching sets of metadata count as `=`, by a heuristic acknowledged as such. A file rewritten with exactly the same size, whose `mtime` was then reset to its original value, would slip through. It has to be done on purpose, and `--strict` is there for those who are not satisfied with that.
 
 That leaves the ambiguous case, the only one that justifies an actual read.  
-The file is downloaded, then compared byte by byte: this is what eliminates the false `*` of a file that was merely touched by a `touch`, a changed `chmod`, a restore, and so on.
+The file is downloaded, then compared byte by byte: this is what eliminates the false `*` of a file that was merely touched by a `touch`, a `sed -i` that changes nothing, a restore, and so on.
 
 The files to download are first gathered, then extracted in **a single** Tarsnap invocation, through the `-T` option, which reads the list of names from a file.  
 One invocation per file would reopen the archive on the server side every time, which becomes ruinous from a hundred files onwards.
@@ -611,9 +612,11 @@ Devices, sockets and named pipes are ignored, and have no business being in `BAC
 
 **The system is alive during the walk:** two successive runs may differ by one without anything abnormal having happened: a temporary file created and then deleted between the two is enough.
 
-**The same GNU dependencies as the rest of the suite:** `find -printf`, `sed -i` and the `%T` extension of the `find` formats.
+**GNU userland, like the rest of the suite:** `find -printf` and the `%T` extension of its formats.
 
 **The comparison is about content, not metadata:** a file whose permissions or owner alone have changed comes out as `=`.
+
+**Passphrase-protected key:** tarsnap asks for the passphrase on the terminal, once for the listing and once more if files have to be downloaded. The script recognises such a key from its format, and then runs the download without the progress spinner, leaving the messages of tarsnap on the terminal, where the prompt stays visible. If `TARSNAP_KEY` is empty, the key designated by `tarsnap.conf` is out of its sight, and it plays it safe in the same way.
 
 ## Statistics and storage cost
 
@@ -740,7 +743,7 @@ The restored file will therefore end up in `/tmp/restore/etc/fstab`: it will **N
 
 `CC0 1.0 Universal` -- Public Domain -- [LICENSE](LICENSE).
 
-`tarsnap-stats.sh`, which comes from [its own repository](https://github.com/deuza/tarsnap-stats)
+`tarsnap-stats.sh`, which comes from [its own repository](https://github.com/deuza/tarsnap-stats), is released under the same license.
 
 
 <p align="center">With ❤️ by <a href="https://github.com/deuza">DeuZa</a></p>
