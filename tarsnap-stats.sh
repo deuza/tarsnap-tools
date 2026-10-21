@@ -49,9 +49,10 @@
 # archive list is being fetched, the live count and the name of the last
 # archive received are shown; nothing at all is drawn before the first archive
 # name arrives, so the progress line can never land on top of a passphrase
-# prompt. That live mode needs stdbuf(1); without it (BSD, macOS) the script
-# falls back to a plain spinner, which does start drawing immediately and may
-# therefore overlap a passphrase prompt. Set TARSNAP_SPINNER=0 to disable it.
+# prompt. That live mode needs stdbuf(1), shipped with GNU coreutils and with
+# the FreeBSD base system; without it, the script falls back to a plain
+# spinner, which does start drawing immediately and may therefore overlap a
+# passphrase prompt. Set TARSNAP_SPINNER=0 to disable it.
 #
 # Exit status:
 #   0  success
@@ -181,8 +182,9 @@ tmpout=$(mktemp "${TMPDIR:-/tmp}/tarsnap-stats.XXXXXX") || {
 
 # stdbuf(1) forces tarsnap to flush every line instead of filling a 4 kB stdio
 # buffer first; without it the archive count would jump from 0 to the total in
-# one go. It is a GNU coreutils tool, absent on the BSDs and on macOS, hence
-# the graceful fallback to a plain spinner.
+# one go. It ships with GNU coreutils and with the FreeBSD base system (since
+# FreeBSD 8.4); when it is missing, the script falls back gracefully to a
+# plain spinner.
 if command -v stdbuf >/dev/null 2>&1; then
     STDBUF='stdbuf'
     SPIN_MODE='count'       # live count of archives received
