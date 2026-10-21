@@ -2,29 +2,29 @@
 #
 # tarsnap-backup.sh
 #
-# Rotation grand-père / père / fils : schéma de rétention classique, hérité
-# de la rotation de bandes magnétiques, ici réimplémenté en sh POSIX.
+# Grandfather / father / son rotation: a classic retention scheme, inherited
+# from magnetic tape rotation, reimplemented here in POSIX sh.
 #
-# Ordre volontaire : on crée AVANT de détruire. Si tarsnap échoue (réseau,
-# quota, clé), set -e coupe le script et aucune archive n'est supprimée.
-# Le pire cas est donc "les vieilles archives s'accumulent", jamais
-# le comportement : "j'ai purgé et je n'ai rien de neuf".
+# Deliberate order: the new archive is created BEFORE anything is destroyed.
+# If tarsnap fails (network, quota, key), set -e aborts the script and no
+# archive is deleted. The worst case is therefore "old archives pile up",
+# never the behaviour: "I purged and I have nothing new".
 #
-# Options :
-#   -n, -d, --dry-run      ne crée aucune archive et ne supprime rien
-#   -v, --verbose          détaille la décision prise pour chaque archive
-#   -s, --snapshot-name N  crée une archive nommée, hors rotation
-#   -o, --orphans          liste les archives hors de portée de la rotation
-#   -h, --help             affiche l'aide
+# Options:
+#   -n, -d, --dry-run      create no archive and delete nothing
+#   -v, --verbose          detail the decision made for each archive
+#   -s, --snapshot-name N  create a named archive, outside the rotation
+#   -o, --orphans          list the archives beyond the reach of the rotation
+#   -h, --help             display the help
 #
-# Le man tarsnap interdit deux opérations de création ou de suppression
-# concurrentes avec la même clé : le script pose donc lui-même un verrou
+# The tarsnap man page forbids two concurrent create or delete operations
+# with the same key: the script therefore takes a lock of its own.
 #
 
-# -e : on sort à la première erreur
-# -u : une variable non définie est une erreur
-# -f : pas de glob sur les expansions non quotées ($BACKUP_DIRS, motifs
-#      d'exclusion). 
+# -e: exit on the first error
+# -u: an unset variable is an error
+# -f: no globbing on unquoted expansions ($BACKUP_DIRS, exclusion
+#     patterns).
 
 set -euf
 
@@ -32,11 +32,11 @@ set -euf
 # CONFIGURATION #
 #################
 
-# --- Chemins absolus des binaires ---
+# --- Absolute paths of the binaries ---
 #
-# Les chemins sont en dur pour ne pas dépendre du $PATH de l'appelant, que ce
-# soit cron, systemd ou un sudo mal réglé. Ils sont donnés pour Debian avec
-# usrmerge, donc tout sous /usr/bin. 
+# The paths are hardcoded so as not to depend on the caller's $PATH, be it
+# cron, systemd or a misconfigured sudo. They are given for Debian with
+# usrmerge, hence everything under /usr/bin.
 #
 TARSNAP_BIN="/usr/bin/tarsnap"
 DATE_BIN="/usr/bin/date"
@@ -47,165 +47,167 @@ DPKG_BIN="/usr/bin/dpkg"
 APT_BIN="/usr/bin/apt"
 FLOCK_BIN="/usr/bin/flock"
 
-# --- Comportement par défaut, écrasable par les options ---
-DRY=0            # 1 = simulation complète, ne crée ni ne supprime aucune archive
-VERBOSE=0        # 1 = détaille chaque décision et passe -v à tarsnap
-SNAPSHOT_NAME="" # non vide = archive nommée, hors rotation
-ORPHANS=0        # 1 = liste les archives hors rotation, puis sort
+# --- Default behaviour, can be overridden by the options ---
+DRY=0            # 1 = full simulation, no archive is created or deleted
+VERBOSE=0        # 1 = detail each decision and pass -v to tarsnap
+SNAPSHOT_NAME="" # non-empty = named archive, outside the rotation
+ORPHANS=0        # 1 = list the archives outside the rotation, then exit
 
 # --- Tarsnap ---
-# Chemin de la clef privée de Tarsnap.
-# Laisser vide pour se reposer sur le keyfile déclaré dans tarsnap.conf.
+# Path of the Tarsnap private key.
+# Leave empty to rely on the keyfile declared in tarsnap.conf.
 TARSNAP_KEY="/root/tarsnap.key"
 
-# Répertoires sauvegardés (séparés par des espaces)
+# Directories to back up (space-separated)
 BACKUP_DIRS="/root /boot /var/www /etc"
 
-# Motifs d'exclusion, séparés par des espaces. Deux formes acceptées :
-#   - motif globbé ("*/tmp/*"), passé tel quel à tarsnap
-#   - chemin absolu ("/var/www/html/APOD"), ancré donc sans effet de bord.
-#     tarsnap retire le / de tête des noms d'entrée (sauf avec -P), la
-#     conversion est faite plus bas.
+# Exclusion patterns, space-separated. Two forms are accepted:
+#   - glob pattern ("*/tmp/*"), passed as is to tarsnap
+#   - absolute path ("/var/www/html/APOD"), anchored, hence no side effect.
+#     tarsnap strips the leading / from entry names (except with -P), the
+#     conversion is done further down.
 BACKUP_EXCLUDE="*/tmp/* /var/www/html/APOD"
 
-# Verrou d'exécution. Dans /run et pas /tmp ni /run/lock, qui sont en 1777 :
-# n'importe quel utilisateur local pourrait y tenir le verrou et bloquer les
-# sauvegardes. /run est en 755 root.
+# Run lock. In /run, and neither in /tmp nor in /run/lock, which are mode
+# 1777: any local user could hold the lock there and block the backups.
+# /run is mode 755, owned by root.
 LOCK_FILE="/run/tarsnap-backup.lock"
 
-# Inventaire des paquets, régénéré avant chaque sauvegarde
+# Package inventory, regenerated before each backup
 PKG_SELECTIONS="/root/pkg-selections.txt"
 PKG_LIST="/root/pkg-list.txt"
 
-# --- Rétention : schéma grand-père / père / fils ---
-# Les trois fenêtres sont CUMULÉES : elles se succèdent au lieu de se
-# recouvrir. Chaque palier prend le relais là où le précédent s'arrête, et
-# la couverture totale est donc DAILY jours + WEEKLY semaines + MONTHLY mois.
-DAILY=90    # tout est conservé sur les N premiers jours
-WEEKLY=12   # puis, sur les N semaines suivantes, celles tombant un $DOW
-MONTHLY=48  # puis, sur les N mois suivants, celles tombant un $DOM
-DOW=1       # jour de la semaine conservé (0 = dimanche, 1 = lundi)
-DOM=1       # jour du mois conservé
+# --- Retention: grandfather / father / son scheme ---
+# The three windows are CUMULATIVE: they follow one another instead of
+# overlapping. Each tier takes over where the previous one stops, and the
+# total coverage is therefore DAILY days + WEEKLY weeks + MONTHLY months.
+DAILY=90    # everything is kept over the first N days
+WEEKLY=12   # then, over the next N weeks, those falling on a $DOW
+MONTHLY=48  # then, over the next N months, those falling on a $DOM
+DOW=1       # day of the week kept (0 = Sunday, 1 = Monday)
+DOM=1       # day of the month kept
 
 ###############################################################################
-# FIN DE LA CONFIGURATION
+# END OF CONFIGURATION
 ###############################################################################
 
-# Déclaration des fonctions 
+# Function declarations
 
-# Code de sortie en argument : 0 pour --help, 1 pour une option invalide.
+# Exit code as argument: 0 for --help, 1 for an invalid option.
 usage() {
     cat >&2 <<EOF
 usage: ${0##*/} [-d|-n|--dry-run] [-v|--verbose] [-h|--help]
-       ${0##*/} [-s|--snapshot-name] NOM
+       ${0##*/} [-s|--snapshot-name] NAME
        ${0##*/} [-o|--orphans]
 
-  -d, -n, --dry-run      simulation complète : rien n'est créé ni supprimé,
-                         seule la commande de purge est affichée. La création
-                         est simulée par tarsnap --dry-run, qui lit les
-                         fichiers, donc c'est aussi long qu'un run réel.
-  -v, --verbose          détaille la décision prise pour chaque archive
-  -s, --snapshot-name N  crée une archive suffixée par N, puis sort sans faire
-                         de rotation. Son nom la rend définitivement intouchable
-                         par la purge. Accepte aussi --snapshot-name=N.
-  -o, --orphans          liste les archives hors de portée de la rotation,
-                         orphelines et partielles, puis sort sans rien
-                         sauvegarder ni supprimer. Lecture seule.
-  -h, --help             affiche cette aide
+  -d, -n, --dry-run      full simulation: nothing is created or deleted,
+                         only the purge command is printed. The creation
+                         is simulated by tarsnap --dry-run, which reads the
+                         files, so it takes as long as a real run.
+  -v, --verbose          detail the decision made for each archive
+  -s, --snapshot-name N  create an archive suffixed with N, then exit
+                         without rotating. Its name makes it permanently
+                         untouchable by the purge. Also accepts
+                         --snapshot-name=N.
+  -o, --orphans          list the archives beyond the reach of the
+                         rotation, orphaned and partial, then exit without
+                         backing up or deleting anything. Read-only.
+  -h, --help             display this help
 EOF
     exit "${1:-1}"
 }
 
-# Affiche seulement en mode verbeux.
-# printf et pas echo : le comportement d'echo sur un backslash ou un
-# argument commençant par "-" n'est pas spécifié par POSIX, et dash
-# interprète les échappements là où bash ne le fait pas.
-# Le "return 0" est indispensable : sans lui, un [ ] faux ferait sortir
-# le script à cause de set -e.
+# Print only in verbose mode.
+# printf and not echo: the behaviour of echo on a backslash or on an
+# argument starting with "-" is not specified by POSIX, and dash
+# interprets escape sequences where bash does not.
+# The "return 0" is essential: without it, a false [ ] would make the
+# script exit because of set -e.
 say() {
     [ "$VERBOSE" -eq 1 ] && printf '%s\n' "$*"
     return 0
 }
 
 die() {
-    printf 'ERREUR: %s\n' "$*" >&2
+    printf 'ERROR: %s\n' "$*" >&2
     exit 1
 }
 
-# prebackup : tout ce qui doit être préparé avant que tarsnap ne lise les
-# fichiers. Inventaires, dumps de bases, export de configuration, appel à un
-# script externe.
+# prebackup: everything that must be prepared before tarsnap reads the
+# files. Inventories, database dumps, configuration export, call to an
+# external script.
 #
-# ATTENTION : prebackup est exécutée AUSSI en --dry-run, et c'est voulu. Une
-# simulation qui ne préparerait pas les mêmes fichiers ne simulerait pas
-# grand-chose. Conséquence pratique : si vous y placez un dump de plusieurs
-# gigaoctets, commentez-le avant d'enchaîner les essais à blanc, sinon chaque
-# --dry-run le rejoue en entier.
+# WARNING: prebackup is ALSO run in --dry-run, and this is intentional. A
+# simulation that did not prepare the same files would not simulate much.
+# Practical consequence: if you put a dump of several gigabytes in it,
+# comment it out before running trial after trial, otherwise every
+# --dry-run replays it in full.
 #
-# La fonction doit rendre 0. Toute autre valeur arrête le script AVANT la
-# création de l'archive, donc avant la moindre suppression : mieux vaut ne
-# rien sauvegarder que sauvegarder une base à moitié dumpée.
+# The function must return 0. Any other value stops the script BEFORE the
+# archive is created, hence before any deletion: better to back up nothing
+# than to back up a half-dumped database.
 prebackup() {
-    say "Inventaire des paquets installés."
+    say "Taking inventory of installed packages."
     "$DPKG_BIN" --get-selections > "$PKG_SELECTIONS"
     "$APT_BIN" list --installed 2>/dev/null > "$PKG_LIST"
 
-    # Exemples à décommenter et à adapter. Déclarez le chemin absolu du
-    # binaire en tête de script, comme les autres, plutôt que de vous en
-    # remettre au $PATH.
+    # Examples to uncomment and adapt. Declare the absolute path of the
+    # binary at the top of the script, like the others, rather than
+    # relying on $PATH.
     #
-    # Dump MySQL / MariaDB. Les identifiants vont dans ~/.my.cnf en 0600,
-    # jamais sur la ligne de commande où ps les rendrait visibles de tous.
-    # say "Dump des bases MySQL."
+    # MySQL / MariaDB dump. The credentials go in ~/.my.cnf with mode 0600,
+    # never on the command line, where ps would make them visible to all.
+    # say "Dumping the MySQL databases."
     # /usr/bin/mysqldump --all-databases --single-transaction --quick \
     #     --events --routines > /root/dumps/mysql-all.sql
     #
-    # Dump PostgreSQL.
-    # say "Dump des bases PostgreSQL."
+    # PostgreSQL dump.
+    # say "Dumping the PostgreSQL databases."
     # su - postgres -c /usr/bin/pg_dumpall > /root/dumps/postgres-all.sql
     #
-    # Table de partitions, pour savoir repartir d un disque nu.
+    # Partition table, to be able to start again from a bare disk.
     # /usr/sbin/sfdisk --dump /dev/sda > /root/partitions-sda.txt
     #
-    # Script externe. Son échec remonte ici et arrête la sauvegarde.
+    # External script. Its failure propagates up to here and stops the
+    # backup.
     # /usr/local/sbin/pre-backup-hook.sh
 
     return 0
 }
 
-# postbackup : le pendant de prebackup, exécutée une fois l'archive créée,
-# snapshot compris, et avant la rotation. Nettoyage des dumps temporaires,
-# notification, redémarrage d'un service arrêté par prebackup.
+# postbackup: the counterpart of prebackup, run once the archive has been
+# created, snapshot included, and before the rotation. Cleanup of the
+# temporary dumps, notification, restart of a service stopped by prebackup.
 #
-# Mêmes règles : exécutée elle aussi en --dry-run, et doit rendre 0. Un échec
-# ici laisse l'archive en place et saute la rotation, donc les anciennes
-# archives s'accumulent. C'est le sens de panne souhaitable.
+# Same rules: it is also run in --dry-run, and it must return 0. A failure
+# here leaves the archive in place and skips the rotation, so the old
+# archives pile up. That is the desirable way to fail.
 postbackup() {
-    # say "Nettoyage des dumps."
+    # say "Cleaning up the dumps."
     # rm -f /root/dumps/mysql-all.sql
     #
-    # say "Notification."
+    # say "Sending the notification."
     # /usr/local/sbin/post-backup-hook.sh
 
     return 0
 }
 
-# Affiche une famille d'archives, puis la commande de suppression qui lui
-# correspond. Rien n'est supprimé : la commande est seulement imprimée, à
-# relire puis à coller soi-même.
+# Print one family of archives, then the matching delete command. Nothing
+# is deleted: the command is only printed, to be reviewed and then pasted
+# by hand.
 orphans_section() {
     _title=$1
     _list=$2
 
     printf -- '--- %s ---\n' "$_title"
     if [ -z "$_list" ]; then
-        printf '  (aucune)\n\n'
+        printf '  (none)\n\n'
         return 0
     fi
     for _a in $_list; do
         printf '  %s\n' "$_a"
     done
-    printf '\n  Suppression, a relire avant de la coller :\n'
+    printf '\n  Delete command, review before pasting:\n'
     if [ -n "$TARSNAP_KEYOPT" ]; then
         printf '  %s %s -d' "$TARSNAP_BIN" "$TARSNAP_KEYOPT"
     else
@@ -218,21 +220,21 @@ orphans_section() {
     return 0
 }
 
-# Liste les archives que la rotation ne touchera jamais. Lecture seule :
-# aucune archive n'est créée ni supprimée.
+# List the archives that the rotation will never touch. Read-only: no
+# archive is created or deleted.
 #
-# Deux familles, pour deux raisons distinctes.
+# Two families, for two distinct reasons.
 #
-# Les orphelines : leur nom ne correspond pas au motif
-# "hostname-AAAA-MM-JJ_HH-MM-SS", donc la purge ne les regarde même pas.
-# Snapshots créés avec -s, archives faites à la main, archives d'une autre
-# machine partageant la même clé, archives datant d'un hostname précédent.
+# The orphans: their name does not match the pattern
+# "hostname-YYYY-MM-DD_HH-MM-SS", so the purge does not even look at them.
+# Snapshots created with -s, archives made by hand, archives from another
+# machine sharing the same key, archives dating from a previous hostname.
 #
-# Les partielles : suffixées .part, vestiges d'une exécution interrompue dont
-# tarsnap a récupéré un checkpoint. Elles comptent pour la déduplication et
-# peuvent contenir des données qui ne sont nulle part ailleurs.
+# The partials: suffixed .part, leftovers of an interrupted run from which
+# tarsnap recovered a checkpoint. They count for deduplication and may
+# contain data found nowhere else.
 list_orphans() {
-    say "Récupération de la liste des archives."
+    say "Fetching the list of archives."
     # shellcheck disable=SC2086
     _all=$("$TARSNAP_BIN" $TARSNAP_KEYOPT --list-archives)
 
@@ -249,25 +251,25 @@ list_orphans() {
         esac
     done
 
-    printf 'Archives hors de portee de la rotation, hostname "%s".\n\n' "$COMPUTER"
-    orphans_section "Orphelines : nom hors motif, jamais purgees" "$_orphans"
-    orphans_section "Partielles : execution interrompue, checkpoint recupere" "$_parts"
+    printf 'Archives beyond the reach of the rotation, hostname "%s".\n\n' "$COMPUTER"
+    orphans_section "Orphans: name outside the pattern, never purged" "$_orphans"
+    orphans_section "Partials: interrupted run, checkpoint recovered" "$_parts"
     return 0
 }
 
-# getopts POSIX ne connaît que les options d'un caractère : on traduit les
-# formes longues avant de le lancer, en acceptant un ou deux tirets.
+# POSIX getopts only knows single-character options: the long forms are
+# translated before running it, with one or two dashes accepted.
 for arg do
     shift
     case "$arg" in
         --help|-help)       usage 0 ;;
         --dry-run|-dry-run) set -- "$@" -d ;;
         --verbose|-verbose) set -- "$@" -v ;;
-        # Forme accolée : on découpe nous-mêmes sur le premier "=".
+        # Attached form: we split on the first "=" ourselves.
         --snapshot-name=*|-snapshot-name=*)
                             set -- "$@" -s "${arg#*=}" ;;
-        # Forme séparée : on émet juste -s, la valeur suit dans $@ et
-        # c'est getopts qui la ramassera, y compris pour râler si elle manque.
+        # Separate form: we only emit -s, the value follows in $@ and
+        # getopts will pick it up, including to complain if it is missing.
         --snapshot-name|-snapshot-name)
                             set -- "$@" -s ;;
         --orphans|-orphans) set -- "$@" -o ;;
@@ -275,9 +277,9 @@ for arg do
     esac
 done
 
-# Attention : le -d du script veut dire "ne supprime rien", à l'exact
-# opposé du -d de tarsnap qui, lui, supprime. -n est accepté en synonyme,
-# c'est la forme la moins ambiguë des deux.
+# Beware: the -d of the script means "delete nothing", the exact opposite
+# of the -d of tarsnap, which does delete. -n is accepted as a synonym, it
+# is the less ambiguous of the two forms.
 while getopts "dhnovs:" option; do
     case "$option" in
         d|n) DRY=1 ;;
@@ -290,41 +292,41 @@ while getopts "dhnovs:" option; do
 done
 
 ###############################################################################
-# GARDE-FOUS
+# SAFEGUARDS
 ###############################################################################
 
-# Tous les binaires configurés doivent être exécutables.
+# All the configured binaries must be executable.
 for bin in "$TARSNAP_BIN" "$DATE_BIN" "$UNAME_BIN" "$LOCALE_BIN" \
            "$GREP_BIN" "$DPKG_BIN" "$APT_BIN" "$FLOCK_BIN"; do
-    [ -x "$bin" ] || die "binaire absent ou non exécutable: $bin"
+    [ -x "$bin" ] || die "binary missing or not executable: $bin"
 done
 
-# Le nom de snapshot finit dans un nom d'archive : on interdit tout ce qui
-# introduirait un espace ou un caractère exotique. Liste explicite plutôt
-# qu'un intervalle [A-Za-z], dont le contenu dépend de la locale.
+# The snapshot name ends up in an archive name: anything that would
+# introduce a space or an exotic character is forbidden. An explicit list
+# rather than a range such as [A-Za-z], whose content depends on the locale.
 case "$SNAPSHOT_NAME" in
     "") ;;
     *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-]*)
-        die "nom de snapshot invalide, caractères autorisés: A-Z a-z 0-9 _ -" ;;
+        die "invalid snapshot name, allowed characters: A-Z a-z 0-9 _ -" ;;
 esac
 
-# La clé doit être lisible, sauf si on délègue à tarsnap.conf.
+# The key must be readable, unless tarsnap.conf is relied upon.
 if [ -n "$TARSNAP_KEY" ] && [ ! -r "$TARSNAP_KEY" ]; then
-    die "clé tarsnap illisible: $TARSNAP_KEY"
+    die "tarsnap key not readable: $TARSNAP_KEY"
 fi
 
-# Locale : on veut une sortie prédictible de tarsnap, apt et date.
+# Locale: we want predictable output from tarsnap, apt and date.
 if ! "$LOCALE_BIN" -a 2>/dev/null | "$GREP_BIN" -qix 'en_US\.utf-\?8'; then
-    die "locale en_US.UTF-8 non générée sur ce système"
+    die "locale en_US.UTF-8 not generated on this system"
 fi
-unset LANGUAGE          # GNU gettext peut surcharger LC_MESSAGES, on dégage
+unset LANGUAGE          # GNU gettext can override LC_MESSAGES, drop it
 LANG=en_US.UTF-8
 LC_ALL=en_US.UTF-8
 export LANG LC_ALL
 
-# Options communes aux invocations de tarsnap. Volontairement laissées non
-# quotées à l'usage : elles doivent disparaître de la ligne de commande
-# quand elles sont vides.
+# Options common to the tarsnap invocations. Deliberately left unquoted
+# where they are used: they must vanish from the command line when they
+# are empty.
 if [ -n "$TARSNAP_KEY" ]; then
     TARSNAP_KEYOPT="--keyfile $TARSNAP_KEY"
 else
@@ -334,171 +336,175 @@ fi
 if [ "$VERBOSE" -eq 1 ]; then
     TARSNAP_MSGOPT="-v"
 else
-    # --quiet ne masque que quelques warnings ("Removing leading '/'", etc.).
-    # C'est --no-print-stats qui neutralise la directive print-stats de
-    # tarsnap.conf, responsable du bloc "All archives / This archive /
-    # New data" imprimé sur stderr en modes c et d.
+    # --quiet only hides a few warnings ("Removing leading '/'", etc.).
+    # It is --no-print-stats that neutralises the print-stats directive of
+    # tarsnap.conf, responsible for the "All archives / This archive /
+    # New data" block printed on stderr in modes c and d.
     TARSNAP_MSGOPT="--quiet --no-print-stats"
 fi
 
 COMPUTER=$("$UNAME_BIN" -n)
 
-# Mode --orphans : lecture seule, donc aucun verrou. Le man tarsnap ne
-# l'impose que pour deux opérations de création ou de suppression
-# concurrentes, pas pour --list-archives : on peut donc interroger pendant
-# qu'une sauvegarde tourne.
+# --orphans mode: read-only, hence no lock. The tarsnap man page only
+# requires it for two concurrent create or delete operations, not for
+# --list-archives: the archives can therefore be queried while a backup
+# is running.
 if [ "$ORPHANS" -eq 1 ]; then
     list_orphans
     exit 0
 fi
 
-# Verrou exclusif non bloquant. Il est porté par le descripteur 9, donc le
-# noyau le libère à la mort du processus, y compris sur kill -9, OOM ou
-# coupure de courant : pas de fichier fantôme à nettoyer à la main, et pas
-# de course possible contrairement à un test d'existence suivi d'un touch.
-exec 9>"$LOCK_FILE" || die "impossible d'ouvrir le verrou: $LOCK_FILE"
+# Non-blocking exclusive lock. It is held by descriptor 9, so the kernel
+# releases it when the process dies, including on kill -9, OOM or power
+# failure: no stale file to clean up by hand, and no possible race, unlike
+# an existence test followed by a touch.
+exec 9>"$LOCK_FILE" || die "cannot open the lock: $LOCK_FILE"
 if ! "$FLOCK_BIN" -n 9; then
-    die "une autre instance tourne déjà (verrou $LOCK_FILE)"
+    die "another instance is already running (lock $LOCK_FILE)"
 fi
 
 ###############################################################################
-# ÉTAPE 1 : SAUVEGARDE
+# STEP 1: BACKUP
 ###############################################################################
 
-# Appel nu, et surtout PAS "prebackup || die ..." ni "if ! prebackup".
-# Placer une fonction dans une condition désactive set -e dans tout son corps :
-# une commande qui échouerait au milieu serait ignorée, les suivantes
-# s'exécuteraient quand même, et la fonction rendrait 0. Comportement vérifié
-# identique sous dash et sous bash. Avec l'appel nu, set -e arrête le script
-# sur la commande fautive, dont le message part dans le mail de cron.
+# Bare call, and above all NOT "prebackup || die ..." nor "if ! prebackup".
+# Placing a function in a condition disables set -e throughout its body: a
+# command failing in the middle would be ignored, the following ones would
+# still run, and the function would return 0. Behaviour verified to be
+# identical under dash and under bash. With the bare call, set -e stops
+# the script on the failing command, whose message goes into the cron mail.
 prebackup
 
 NOW=$("$DATE_BIN" +%Y-%m-%d_%H-%M-%S)
 if [ -n "$SNAPSHOT_NAME" ]; then
-    # Le suffixe fait sortir l'archive du motif testé par la rotation :
-    # elle devient définitivement intouchable par la purge.
+    # The suffix takes the archive out of the pattern tested by the
+    # rotation: it becomes permanently untouchable by the purge.
     NAME="${COMPUTER}-${NOW}_${SNAPSHOT_NAME}"
 else
     NAME="${COMPUTER}-${NOW}"
 fi
 
-# Construction des --exclude dans les paramètres positionnels : c'est le
-# seul "tableau" dont dispose sh POSIX.
+# The --exclude options are built in the positional parameters: it is the
+# only "array" POSIX sh has.
 set --
 for pattern in $BACKUP_EXCLUDE; do
     case "$pattern" in
         /*)
-            # Chemin absolu : on retire le / de tête pour coller aux noms
-            # d'entrée réels, et on génère le motif du répertoire ainsi que
-            # celui de son contenu.
+            # Absolute path: the leading / is stripped to match the actual
+            # entry names, and both the pattern of the directory and the
+            # pattern of its contents are generated.
             rel=${pattern#/}
             set -- "$@" --exclude="$rel" --exclude="$rel/*"
             ;;
         *)
-            # Motif déjà relatif ou globbé, passé tel quel.
+            # Pattern already relative or globbed, passed as is.
             set -- "$@" --exclude="$pattern"
             ;;
     esac
 done
 
-# En dry-run on simule aussi la création : tarsnap ne contacte pas le
-# serveur, aucune archive n'est réellement créée. Deux variantes, choisies
-# selon le niveau de verbosité demandé.
+# In dry-run the creation is simulated too: tarsnap does not contact the
+# server, and no archive is actually created. Two variants, chosen
+# according to the requested level of verbosity.
 if [ "$DRY" -eq 1 ]; then
-    # --dry-run et pas --dry-run-metadata. Cette dernière, ajoutée en 1.0.41,
-    # serait pourtant bien plus rapide, elle ne lit aucune donnée. Elle échoue
-    # dès que le cache de chunks est peuplé :
+    # --dry-run and not --dry-run-metadata. The latter, added in 1.0.41,
+    # would nevertheless be much faster, as it reads no data. It fails as
+    # soon as the chunk cache is populated:
     #
     #   tarsnap: Programmer error: writetape_writechunk unexpectedly returned 0
     #   tarsnap: Error writing cached archive entry
     #
-    # Reproduit en 1.0.41 sur chacun des quatre répertoires de BACKUP_DIRS pris
-    # isolément, avec un cachedir issu d'une vraie sauvegarde. Le même appel
-    # contre un cachedir fraîchement initialisé passe sans broncher, ce qui
-    # isole le cache comme seule variable. print-stats n'y est pour rien :
-    # l'échec se produit aussi avec --no-print-stats.
+    # Reproduced in 1.0.41 on each of the four directories of BACKUP_DIRS
+    # taken individually, with a cachedir coming from a real backup. The
+    # same call against a freshly initialised cachedir goes through without
+    # a hitch, which isolates the cache as the only variable. print-stats
+    # has nothing to do with it: the failure also occurs with
+    # --no-print-stats.
     #
-    # Cause, côté source 1.0.41 : multitape_write.c:429 pose
-    # no_chunkifiers = (dryrun == 2), ce qui prive de chunkifier les flux
-    # initialisés lignes 517 à 521, alors que la couche chunks d->C est créée
-    # sans condition sur dryrun ligne 503. writetape_ischunkpresent répond donc
-    # "présent" là où writetape_writechunk rend 0, et ccache_entry.c:409 traite
-    # ce 0 comme une erreur de programmation.
+    # Cause, on the 1.0.41 source side: multitape_write.c:429 sets
+    # no_chunkifiers = (dryrun == 2), which deprives the streams initialised
+    # on lines 517 to 521 of a chunkifier, whereas the chunk layer d->C is
+    # created on line 503 with no condition on dryrun. As a result,
+    # writetape_ischunkpresent answers "present" where writetape_writechunk
+    # returns 0, and ccache_entry.c:409 treats that 0 as a programmer error.
     #
-    # Ne pas remettre l'option sans avoir vérifié que c'est corrigé en amont.
+    # Do not put the option back without checking that this has been fixed
+    # upstream.
     set -- --dry-run "$@"
-    say "Simulation de l'archive ${NAME}."
+    say "Simulating archive ${NAME}."
 else
-    say "Création de l'archive ${NAME}."
+    say "Creating archive ${NAME}."
 fi
 
 # shellcheck disable=SC2086
 "$TARSNAP_BIN" $TARSNAP_KEYOPT $TARSNAP_MSGOPT -c -f "$NAME" "$@" $BACKUP_DIRS
 
-# Pendant de prebackup, joué que l'on soit en snapshot ou en sauvegarde
-# normale : ce que prebackup a mis en place doit être défait dans tous les cas.
-# Appel nu pour la même raison que plus haut.
+# Counterpart of prebackup, run whether this is a snapshot or a normal
+# backup: whatever prebackup set up must be undone in every case.
+# Bare call, for the same reason as above.
 postbackup
 
-# Un snapshot est un acte ponctuel : on ne veut pas qu'en enchaîner trois
-# avant une mise en prod déclenche trois purges.
+# A snapshot is a one-off action: chaining three of them before going into
+# production must not trigger three purges.
 if [ -n "$SNAPSHOT_NAME" ]; then
     if [ "$DRY" -eq 1 ]; then
-        say "Snapshot ${NAME} simulé, rotation ignorée."
+        say "Snapshot ${NAME} simulated, rotation skipped."
     else
-        say "Snapshot ${NAME} créé, rotation ignorée."
+        say "Snapshot ${NAME} created, rotation skipped."
     fi
     exit 0
 fi
 
 ###############################################################################
-# ÉTAPE 2 : ROTATION
+# STEP 2: ROTATION
 ###############################################################################
 
 NOW_UNIX=$("$DATE_BIN" +%s)
 
-# Bornes des trois fenêtres cumulées, exprimées en âge depuis maintenant.
-# WEEKLY_SEC part de la fin du quotidien, et la borne mensuelle recule
-# d'autant : une archive de 100 jours sort du quotidien (90 jours) mais
-# tombe dans l'hebdomadaire, qui court de 90 à 174 jours.
+# Bounds of the three cumulative windows, expressed as an age counted from
+# now. WEEKLY_SEC starts at the end of the daily window, and the monthly
+# bound moves back by the same amount: an archive aged 100 days leaves the
+# daily window (90 days) but falls into the weekly one, which runs from 90
+# to 174 days.
 #
-# La variante à fenêtres absolues, où les trois seraient comptées depuis
-# maintenant, imposerait l'invariant DAILY < WEEKLY*7 < MONTHLY*30. Faute
-# de quoi un palier devient silencieusement inatteignable : avec DAILY=90
-# et WEEKLY=12, les 84 jours de l'hebdomadaire tiennent entièrement dans
-# les 90 jours du quotidien, et le palier père ne conserve jamais rien.
+# The variant with absolute windows, where all three would be counted from
+# now, would require the invariant DAILY < WEEKLY*7 < MONTHLY*30. Without
+# it, a tier silently becomes unreachable: with DAILY=90 and WEEKLY=12, the
+# 84 days of the weekly window fit entirely within the 90 days of the daily
+# one, and the father tier never keeps anything.
 DAILY_SEC=$((DAILY * 86400))
 WEEKLY_SEC=$((DAILY_SEC + WEEKLY * 604800))
 MONTHLY_UNIX=$(($("$DATE_BIN" -d "-${MONTHLY} months" +%s) - WEEKLY_SEC))
 
-say "Récupération de la liste des archives."
+say "Fetching the list of archives."
 # shellcheck disable=SC2086
 ARCHIVES=$("$TARSNAP_BIN" $TARSNAP_KEYOPT --list-archives)
 
-# On repart d'un jeu de paramètres positionnels vide : il va servir
-# d'accumulateur des "-f archive" à supprimer.
+# Start again from an empty set of positional parameters: it will serve as
+# the accumulator of the "-f archive" pairs to delete.
 set --
 
-# Le motif de nommage interdit l'espace, le découpage sur IFS est donc sûr.
+# The naming pattern forbids spaces, so splitting on IFS is safe.
 for archive in $ARCHIVES; do
 
-    # Garde-fou principal : on ne touche QUE ce qui respecte exactement
-    # "hostname-AAAA-MM-JJ_HH-MM-SS". 
-    # Tout le reste (snapshots crées à la main) est hors de portée du script.
+    # Main safeguard: we touch ONLY what exactly matches
+    # "hostname-YYYY-MM-DD_HH-MM-SS".
+    # Everything else (snapshots created by hand) is beyond the reach of
+    # the script.
     case "$archive" in
         *.part)
-            # Archive interrompue (coupure de courant, réseau, ^Q) dont un
-            # checkpoint a été récupéré. Elle compte pour la déduplication et
-            # peut avoir de la valeur : on ne la supprime pas, on prévient.
-            # Le message part sur stderr, donc dans le mail de cron.
-            printf 'ATTENTION: archive partielle: %s\n' "$archive" >&2
-            printf '  reste d une execution interrompue, a traiter a la main\n' >&2
+            # Interrupted archive (power failure, network, ^Q) from which a
+            # checkpoint was recovered. It counts for deduplication and may
+            # be of value: it is not deleted, a warning is issued instead.
+            # The message goes to stderr, hence into the cron mail.
+            printf 'WARNING: partial archive: %s\n' "$archive" >&2
+            printf '  leftover of an interrupted run, to be handled by hand\n' >&2
             continue
             ;;
         "${COMPUTER}-"[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]-[0-9][0-9])
             ;;
         *)
-            say "Hors motif, intouchable: $archive"
+            say "Outside the pattern, untouchable: $archive"
             continue
             ;;
     esac
@@ -509,54 +515,54 @@ for archive in $ARCHIVES; do
 
     f_unix=$("$DATE_BIN" -d "$day" +%s)
     f_dow=$("$DATE_BIN" -d "$day" +%w)
-    f_dom=$("$DATE_BIN" -d "$day" +%-d)   # %-d : sans zéro de tête, pas d'octal
+    f_dom=$("$DATE_BIN" -d "$day" +%-d)   # %-d: no leading zero, no octal
 
     age=$((NOW_UNIX - f_unix))
 
-    # Fils : tout ce qui est récent.
+    # Son: everything that is recent.
     if [ "$age" -lt "$DAILY_SEC" ]; then
-        say "Quotidien (0 a $DAILY j), conservée: $archive"
+        say "Daily (0 to $DAILY days), kept: $archive"
         continue
     fi
 
-    # Père : le bon jour de semaine, dans la fenêtre hebdomadaire, qui prend
-    # le relais du quotidien et ne le recouvre pas.
+    # Father: the right day of the week, within the weekly window, which
+    # takes over from the daily one and does not overlap it.
     if [ "$f_dow" -eq "$DOW" ] && [ "$age" -lt "$WEEKLY_SEC" ]; then
-        say "Hebdo ($DAILY a $((WEEKLY_SEC / 86400)) j) DOW=$f_dow, conservée: $archive"
+        say "Weekly ($DAILY to $((WEEKLY_SEC / 86400)) days) DOW=$f_dow, kept: $archive"
         continue
     fi
 
-    # Grand-père : le bon jour du mois, dans la fenêtre mensuelle, qui prend
-    # à son tour le relais de l'hebdomadaire.
+    # Grandfather: the right day of the month, within the monthly window,
+    # which in turn takes over from the weekly one.
     if [ "$f_dom" -eq "$DOM" ] && [ "$f_unix" -gt "$MONTHLY_UNIX" ]; then
-        say "Mensuel (au-dela de $((WEEKLY_SEC / 86400)) j) DOM=$f_dom, conservée: $archive"
+        say "Monthly (beyond $((WEEKLY_SEC / 86400)) days) DOM=$f_dom, kept: $archive"
         continue
     fi
 
     set -- "$@" -f "$archive"
 done
 
-# Deux paramètres par archive (-f et le nom).
+# Two parameters per archive (-f and the name).
 COUNT=$(($# / 2))
 
 if [ "$COUNT" -eq 0 ]; then
-    say "Rien à purger."
+    say "Nothing to purge."
     exit 0
 fi
 
-say "$COUNT archive(s) à supprimer."
+say "$COUNT archive(s) to delete."
 
 if [ "$DRY" -eq 1 ]; then
-    printf 'Dry-run, commande qui serait exécutée:\n'
+    printf 'Dry-run, command that would be executed:\n'
     printf '%s %s %s -d %s\n' \
         "$TARSNAP_BIN" "$TARSNAP_KEYOPT" "$TARSNAP_MSGOPT" "$*"
     exit 0
 fi
 
-# Un seul appel : le man autorise -f répété en mode -d, et tarsnap met en
-# cache les métadonnées, ce qui accélère nettement une purge groupée.
+# A single call: the man page allows -f to be repeated in -d mode, and
+# tarsnap caches the metadata, which noticeably speeds up a batch purge.
 # shellcheck disable=SC2086
 "$TARSNAP_BIN" $TARSNAP_KEYOPT $TARSNAP_MSGOPT -d "$@"
 
-say "Terminé."
+say "Done."
 exit 0
