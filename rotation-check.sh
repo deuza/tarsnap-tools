@@ -52,9 +52,19 @@ OPT_DOW=""
 OPT_DOM=""
 
 usage() {
+    # The continuation line of the synopsis is aligned under the first
+    # option, whatever the name the script was installed under: as many
+    # spaces as "usage: " plus that name, counted with parameter expansions
+    # only, without any external binary, exactly as in tarsnap-diff.sh.
+    _pad="       "
+    _rest=${0##*/}
+    while [ -n "$_rest" ]; do
+        _pad="$_pad "
+        _rest=${_rest#?}
+    done
     cat >&2 <<EOF
 usage: ${0##*/} [-D days] [-f script] [-d DAILY] [-w WEEKLY] [-m MONTHLY]
-                [-o DOW] [-M DOM] [-l file|-] [-h]
+$_pad [-o DOW] [-M DOM] [-l file|-] [-h]
 
   -D days     simulation horizon (default $DAYS)
   -f script   path of the tarsnap-backup.sh to read the configuration from
