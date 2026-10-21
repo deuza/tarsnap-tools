@@ -214,14 +214,14 @@ Everything is set in the block at the top of the file, between `CONFIGURATION` a
 
 ### Binary paths
 
-`TARSNAP_BIN`, `DATE_BIN`, `UNAME_BIN`, `LOCALE_BIN`, `GREP_BIN`, `DPKG_BIN`, `APT_BIN`, `FLOCK_BIN`.
+`TARSNAP_BIN`, `DATE_BIN`, `UNAME_BIN`, `LOCALE_BIN`, `GREP_BIN`, `SED_BIN`, `DPKG_BIN`, `APT_BIN`, `FLOCK_BIN`.
 
 The binary paths are hardcoded so as not to depend on the caller's `PATH`, be it `cron`, `systemd` or a misconfigured `sudo`.  
 The shipped values are those of Debian with `usrmerge`, hence everything under `/usr/bin`. At startup, the script checks that each of them is executable, and refuses to run otherwise.
 
 ### Tarsnap
 
-`TARSNAP_KEY`: the path of the Tarsnap key. Leave the variable empty to rely on the `keyfile` declared in `tarsnap.conf`.  
+`TARSNAP_KEY`: the path of the Tarsnap key. Leave the variable empty to rely on the `keyfile` declared in `tarsnap.conf`, at the cost of the passphrase check (see [Known limitations](#known-limitations)).  
 A single key is enough: on the Tarsnap side, the delete permission implies the read permission, so a separate read-only key would only be a strict subset.
 
 The `cachedir`, on the other hand, is not passed on the command line. It is read from `tarsnap.conf`.
@@ -720,6 +720,11 @@ Elsewhere, it will refuse to start until the configuration block and the package
 
 **Tarsnap exit code 2 is not singled out:** Tarsnap uses it to report an error that occurred after the server-side state had already been modified.  
 `set -e` treats it like any other error.
+
+**Passphrase-protected key:** Tarsnap reads the key again on every invocation, and therefore asks for the passphrase again, up to three times per run: creation, listing, purge.  
+Without a terminal, under `cron` for example, the script stops before `prebackup`, with an explicit message. A standard input that is not a terminal counts as no terminal: piping the passphrase in is not supported, since every invocation would read it again. To run the script through `ssh host command`, add `-t`.
+
+This check only covers the key named in `TARSNAP_KEY`. With `TARSNAP_KEY` empty, the key designated by `tarsnap.conf` is out of the script's sight, and a protected key will only fail once `prebackup` has run.
 
 ## Restoring
 

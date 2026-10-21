@@ -43,6 +43,7 @@ DATE_BIN="/usr/bin/date"
 UNAME_BIN="/usr/bin/uname"
 LOCALE_BIN="/usr/bin/locale"
 GREP_BIN="/usr/bin/grep"
+SED_BIN="/usr/bin/sed"
 DPKG_BIN="/usr/bin/dpkg"
 APT_BIN="/usr/bin/apt"
 FLOCK_BIN="/usr/bin/flock"
@@ -257,6 +258,22 @@ list_orphans() {
     return 0
 }
 
+# Passphrase-protected key. A text key file, once its comments and blank
+# lines are skipped and its base64 decoded, starts with "scrypt" when it is
+# encrypted and with "tarsnap\0" otherwise: this is the format described,
+# and the very test made, in lib/keyfile/keyfile.c of tarsnap. In base64,
+# "scrypt" gives exactly the first 8 characters of the first data line,
+# "c2NyeXB0": no decoding needed. A raw binary key file (first byte 0x00
+# or 0xff) is never encrypted and never matches. Kept identical to the
+# function of the same name in tarsnap-diff.sh.
+key_is_passphrased() {
+    _first=$("$SED_BIN" -n '/^#/d; /^[[:space:]]*$/d; p; q' "$1")
+    case "$_first" in
+        c2NyeXB0*) return 0 ;;
+    esac
+    return 1
+}
+
 # POSIX getopts only knows single-character options: the long forms are
 # translated before running it, with one or two dashes accepted.
 for arg do
@@ -297,7 +314,7 @@ done
 
 # All the configured binaries must be executable.
 for bin in "$TARSNAP_BIN" "$DATE_BIN" "$UNAME_BIN" "$LOCALE_BIN" \
-           "$GREP_BIN" "$DPKG_BIN" "$APT_BIN" "$FLOCK_BIN"; do
+           "$GREP_BIN" "$SED_BIN" "$DPKG_BIN" "$APT_BIN" "$FLOCK_BIN"; do
     [ -x "$bin" ] || die "binary missing or not executable: $bin"
 done
 
@@ -313,6 +330,42 @@ esac
 # The key must be readable, unless tarsnap.conf is relied upon.
 if [ -n "$TARSNAP_KEY" ] && [ ! -r "$TARSNAP_KEY" ]; then
     die "tarsnap key not readable: $TARSNAP_KEY"
+fi
+
+# Passphrase-protected key. tarsnap reads the key again on each invocation,
+# hence asks for the passphrase again, up to three times per run: creation,
+# listing, purge. It asks through readpass() from libcperciva, which reads
+# /dev/tty if it can open it, otherwise stdin, and only prompts on stderr
+# when its source is a terminal. Without a terminal, as under cron, tarsnap
+# fails on "EOF reading password", but only after prebackup, and therefore
+# the dumps, have run. Hence this check, made here and in every mode, since
+# all of them read the key (normal, --dry-run, -s and --orphans), rather
+# than in prebackup, which is a user hook.
+#
+# "A terminal is available" is tested as close as possible to readpass():
+#   - /dev/tty is really opened. [ -r /dev/tty ] would not do: the node is
+#     mode 0666 and passes access() even without a controlling terminal,
+#     only open() fails, with ENXIO. The subshell keeps set -e safe: a
+#     failed redirection on exec, a special built-in, ends the subshell,
+#     not the script.
+#   - failing that, stdin must be a terminal, as after a setsid launched
+#     from a terminal: readpass() then falls back on it and prompts there.
+# A stdin that is not a terminal counts as no terminal, even with the
+# passphrase piped into it: each tarsnap invocation, and the commands of
+# prebackup, would read that same stdin.
+#
+# With TARSNAP_KEY empty, the key designated by tarsnap.conf is out of
+# sight: nothing is tested, and a protected key still fails later, after
+# prebackup. tarsnap-diff.sh then assumes that the key may prompt, which
+# only costs it some display; here, the same assumption would block every
+# cron job whose plain key is declared in tarsnap.conf.
+if [ -n "$TARSNAP_KEY" ] && key_is_passphrased "$TARSNAP_KEY"; then
+    if ( exec </dev/tty ) 2>/dev/null || [ -t 0 ]; then
+        say "Passphrase-protected key: tarsnap will ask for it on each call."
+    else
+        die "passphrase-protected key, no terminal to type the passphrase:" \
+            "$TARSNAP_KEY"
+    fi
 fi
 
 # Locale: we want predictable output from tarsnap, apt and date.
