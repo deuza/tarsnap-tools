@@ -19,7 +19,7 @@ It is written for Debian, in strictly POSIX `sh`, with no dependency on `bash` b
 The main script is `tarsnap-backup.sh`, which takes care of your backups: once it is configured, there is no need to touch it again.  
 It prepares what needs to be prepared, creates a dated archive, then purges the old ones according to a three-tier retention scheme.
 
-Three tools come with it (none of them creates or deletes a single archive):
+Three tools come with it, and none of them creates or deletes a single archive. The whole suite:
 
 | Script | Role |
 |---|---|
@@ -29,7 +29,7 @@ Three tools come with it (none of them creates or deletes a single archive):
 | `tarsnap-stats.sh` | sizes, deduplication and storage cost |
 
 These scripts were developed and tested with Tarsnap 1.0.41 on Debian Trixie, and are used daily by the author.  
-They are extensively commented, so that they can be understood, modified, adapted, and so on.
+They are extensively commented, so that they can be understood, modified, adapted, and so on, and [HACKING.md](HACKING.md) gathers the rules they follow and the reasons behind the less obvious choices.
 
 **NOTE: Take the time to read this README calmly and in full before starting the installation. Usage and configuration are fairly simple, but they require an understanding of what the different tools do.**
 
@@ -47,7 +47,6 @@ They are extensively commented, so that they can be understood, modified, adapte
 - [Comparing a snapshot with the system](#comparing-a-snapshot-with-the-system)
 - [Statistics and storage cost](#statistics-and-storage-cost)
 - [Design guarantees](#design-guarantees)
-- [Technical choices](#technical-choices)
 - [Known limitations](#known-limitations)
 - [Restoring](#restoring)
 - [License](#license)
@@ -113,7 +112,8 @@ Over five years of daily backups, with the default values:
 ```
 
 One hundred and fifty-two archives kept out of one thousand eight hundred and twenty-five.  
-These figures are those of the provided diagnostic script `rotation-check.sh`, not an estimate!
+These figures are those of the provided diagnostic script `rotation-check.sh`, not an estimate!  
+The exact count depends on the day you run it, since the 1sts of the month do not always fall at the same place in the windows: simulated on every day of 2026 and 2027, it stays between 150 and 153.
 
 ### Why purge so little?
 
@@ -139,9 +139,12 @@ You need, in this order:
 
 (Binary .deb packages are only provided for i386 and amd64. On any other architecture, for example a Raspberry Pi in `aarch64` like mine, you will have to go through [the .deb build page](https://www.tarsnap.com/pkg-deb.html#tarsnap-source-package).)
 
+Debian itself has shipped a `tarsnap` package in its `non-free` section since 2026, for most architectures including `arm64`, but at the time of writing only in testing (Forky) and unstable (Sid), not in Trixie.
+
 Note: it is the `libext2fs-dev` package that provides `ext2fs/ext2_fs.h`, required by tarsnap, not to be confused with `linux/ext2_fs.h`!
 
-**The base tools**, already present on a standard Debian: `flock` (util-linux), `date` and `sed` (coreutils and sed), `dpkg` and `apt`.
+**The base tools**, already present on a standard Debian: `flock` (util-linux), `dpkg` and `apt` for the backup, and the usual `coreutils`, `grep`, `sed`, `find`, `cmp` and `locale` for the whole suite.  
+`stdbuf` (coreutils) is optional: without it, the progress line of `tarsnap-diff.sh` loses its live counter.
 
 **The `en_US.UTF-8` locale must be generated**, for predictable output from tarsnap, `apt` and `date`. The script refuses to start without it:
 
@@ -212,6 +215,10 @@ Only errors and warnings go to standard error, hence into the `cron` mail, or el
 
 Everything is set in the block at the top of the file, between `CONFIGURATION` and `END OF CONFIGURATION`.
 
+`rotation-check.sh` and `tarsnap-diff.sh` read part of this block as plain text, without ever running the file: the five retention values, `TARSNAP_KEY`, `BACKUP_DIRS` and `BACKUP_EXCLUDE`.  
+Keep the shipped layout for these: one line each, starting with the name and defined only once, integers without quotes, strings between double quotes, no `$VARIABLE`, and no trailing comment containing a double quote.  
+Renaming one of them breaks the tool that reads it: see [HACKING.md](HACKING.md#configuration-read-by-the-companion-tools).
+
 ### Binary paths
 
 `TARSNAP_BIN`, `DATE_BIN`, `UNAME_BIN`, `LOCALE_BIN`, `GREP_BIN`, `SED_BIN`, `DPKG_BIN`, `APT_BIN`, `FLOCK_BIN`.
@@ -221,7 +228,7 @@ The shipped values are those of Debian with `usrmerge`, hence everything under `
 
 ### Tarsnap
 
-`TARSNAP_KEY`: the path of the Tarsnap key. Leave the variable empty to rely on the `keyfile` declared in `tarsnap.conf`, at the cost of the passphrase check (see [Known limitations](#known-limitations)).  
+`TARSNAP_KEY`: the path of the Tarsnap key, which must not contain whitespace. Leave the variable empty to rely on the `keyfile` declared in `tarsnap.conf`, at the cost of the passphrase check (see [Known limitations](#known-limitations)).  
 A single key is enough: on the Tarsnap side, the delete permission implies the read permission, so a separate read-only key would only be a strict subset.
 
 The `cachedir`, on the other hand, is not passed on the command line. It is read from `tarsnap.conf`.
@@ -256,6 +263,8 @@ root@foo:~/tarsnap-backup#
 
 - `BACKUP_DIRS`: directories to include, space-separated.  
 - `BACKUP_EXCLUDE`: exclusion patterns, space-separated.
+
+Both lists are split on spaces: a path containing whitespace cannot appear in either of them.
 
 Two forms are accepted:
 
@@ -324,6 +333,9 @@ Any other value, and any command failing inside it, stops the script:
 
 In both cases, the script fails in the right direction.
 
+The error you get is the one printed by the failing command itself.  
+Before adding a command or a script to one of these functions, check that it runs cleanly: a `--dry-run` that leaves nothing in the `cron` mail, or a run with `--verbose`.
+
 ### Both functions also run in `--dry-run` mode
 
 This is intentional: a simulation that did not prepare the same files would not simulate much, since those files are exactly what Tarsnap is supposed to read.  
@@ -338,7 +350,8 @@ usage: tarsnap-backup.sh [-d|-n|--dry-run] [-v|--verbose] [-h|--help]
 ```
 
 `-d`, `-n`, `--dry-run`: full simulation. Nothing is created or deleted, and the purge command that would be executed is displayed.  
-Beware: the creation is simulated by `tarsnap --dry-run`, which really reads the files: it takes as long as a real run.
+Beware: the creation is simulated by `tarsnap --dry-run`, which really reads the files: it takes as long as a real run.  
+The faster `--dry-run-metadata` of Tarsnap 1.0.41 is deliberately not used: see [HACKING.md](HACKING.md#the---dry-run-metadata-bug).
 
 **Note that the script's `-d` means "delete nothing", the exact opposite of Tarsnap's `-d`: `-n` is accepted as a synonym and remains the less ambiguous form.**
 
@@ -353,6 +366,8 @@ The allowed characters are `A-Z`, `a-z`, `0-9`, `_` and `-`. The `--snapshot-nam
 `-o`, `--orphans`: lists the archives beyond the reach of the rotation, then exits. See the next section.
 
 `-h`, `--help`: displays the help.
+
+Long options also accept a single leading dash: `-dry-run` is read as `--dry-run`.
 
 ## Archives outside the rotation
 
@@ -370,12 +385,12 @@ The option is read-only: it creates nothing, deletes nothing, and does not even 
 It distinguishes two families, for two different reasons:
 
 **- Orphaned snapshots:**  
-Their names do not match the pattern of the snapshots created by `tarsnap-backup.sh`, so the purge excludes them outright.
+Their names do not match the pattern of the rotation archives, so the purge excludes them outright: snapshots taken with `-s`, archives made by hand, archives of another machine sharing the same key, archives dating from a previous hostname.
 
 This covers any snapshot created with the Tarsnap key under another name: the purge touches **ONLY** what EXACTLY matches the pattern **`hostname-YYYY-MM-DD_HH-MM-SS`**
 
 **- Partial archives:**  
-Suffixed `.part`, they are the leftovers of an interrupted run from which Tarsnap recovered a checkpoint.
+Suffixed `.part`, they are what is left of an interrupted run: an archive truncated on purpose, by `^Q`, `SIGQUIT` or `--maxbw`, or the last checkpoint of a run that died, which Tarsnap recovers at the next creation or deletion.
 
 They count for deduplication and may contain data found nowhere else.  
 The script already reports them on standard error at every rotation. The `--orphans` option gathers them so that you can decide with a cool head.
@@ -384,6 +399,8 @@ For each family, the matching delete command is displayed, ready to be reviewed 
 It will never be run by the script:
 
 ```
+Archives beyond the reach of the rotation, hostname "foo".
+
 --- Orphans: name outside the pattern, never purged ---
   foo-2026-01-10_03-00-00_before-prod
   old-manual-backup
@@ -391,6 +408,12 @@ It will never be run by the script:
 
   Delete command, review before pasting:
   /usr/bin/tarsnap --keyfile /root/tarsnap.key -d -f foo-2026-01-10_03-00-00_before-prod -f old-manual-backup -f bar-2024-02-01_02-00-00
+
+--- Partials: interrupted run, checkpoint recovered ---
+  foo-2026-10-20_00-02-01.part
+
+  Delete command, review before pasting:
+  /usr/bin/tarsnap --keyfile /root/tarsnap.key -d -f foo-2026-10-20_00-02-01.part
 ```
 
 ## Checking your retention configuration
@@ -423,9 +446,11 @@ Replay the decision on your **real** archives:
 tarsnap --list-archives | ./rotation-check.sh -l -
 ```
 
-The output starts by showing where the configuration comes from, then shows the three ranges:
+The output starts with where the configuration comes from and the three ranges, followed by the counters shown [above](#what-it-looks-like-in-practice):
 
 ```
+tarsnap-backup: rotation consistency check
+------------------------------------------
 configuration read from /usr/local/sbin/tarsnap-backup.sh
 
 daily      DAILY=90   all              from     0 to    90 d
@@ -433,11 +458,40 @@ weekly     WEEKLY=12  DOW=1            from    90 to   174 d
 monthly    MONTHLY=48 DOM=1            from   174 to  1635 d
 ```
 
+In replay mode, the archives are sorted by name, hence by host and then by date, and each one gets its verdict:
+
+```
+Replay against the real list, hostname "foo":
+
+  foo-2026-01-10_03-00-00_before-prod outside the pattern, untouchable
+  foo-2026-03-01_00-02-01             KEPT  (grandfather, monthly)
+  foo-2026-03-02_00-02-01             DELETED
+  foo-2026-06-01_00-02-02             KEPT  (father, weekly)
+  foo-2026-10-20_00-02-01.part        PARTIAL, left in place
+  foo-2026-10-21_00-02-01             KEPT  (son, daily)
+```
+
+The options:
+
+| Option | Effect |
+|---|---|
+| `-D days` | simulation horizon, 1825 days by default |
+| `-f script` | path of the `tarsnap-backup.sh` to read |
+| `-d DAILY` | overrides the daily window, in days |
+| `-w WEEKLY` | overrides the weekly window, in weeks |
+| `-m MONTHLY` | overrides the monthly window, in months |
+| `-o DOW` | overrides the day of the week kept, 0 = Sunday |
+| `-M DOM` | overrides the day of the month kept |
+| `-l file` | replays the decision against a list of archives, `-` for standard input |
+| `-h` | displays the help |
+
 ## Comparing a snapshot with the system
 
 The repository also includes the `tarsnap-diff.sh` script, which compares a Tarsnap snapshot with the current state of the machine and tells you what has changed since.
 
 It sticks to the scope actually backed up: `BACKUP_DIRS`, `BACKUP_EXCLUDE` and `TARSNAP_KEY` are read from `tarsnap-backup.sh`, with the same search order as `rotation-check.sh` and the same precaution: the file is never sourced.
+
+Its own configuration block, at the top of the file, only holds the binary paths, `LOG_DIR` and the installed path of `tarsnap-backup.sh`.
 
 No archive is touched.  
 Only `-tv` and `-x` are used, both read-only on the Tarsnap side: *"Extracting or listing archives may be performed in parallel with any other operation"*.  
@@ -476,8 +530,7 @@ Two matching sets of metadata count as `=`, by a heuristic acknowledged as such.
 That leaves the ambiguous case, the only one that justifies an actual read.  
 The file is downloaded, then compared byte by byte: this is what eliminates the false `*` of a file that was merely touched by a `touch`, a `sed -i` that changes nothing, a restore, and so on.
 
-The files to download are first gathered, then extracted in **a single** Tarsnap invocation, through the `-T` option, which reads the list of names from a file.  
-One invocation per file would reopen the archive on the server side every time, which becomes ruinous from a hundred files onwards.
+All the files to download are fetched in **a single** Tarsnap invocation, rather than one per file.
 
 ### Strict mode
 
@@ -511,7 +564,7 @@ The other steps cannot be skipped. "deleted" and "new" are deduced by matching t
 ### The log
 
 On a machine that has been in production for some time, the diff runs to tens of thousands of lines, and a terminal's buffer is not an analysis tool.  
-The details are therefore written to a file, `/var/log/tarsnap-diff.sh-<snapshot>.log` (by default), and only the numeric summary is displayed:
+The details are therefore written to a file, `$LOG_DIR/<script name>-<snapshot>.log`, i.e. `/var/log/tarsnap-diff.sh-<snapshot>.log` by default, and only the numeric summary is displayed:
 
 ```
 root@foo:~# ./tarsnap-diff.sh foo-2026-07-27_00-02-05
@@ -527,10 +580,10 @@ Diff of foo-2026-07-27_00-02-05
 Details: /var/log/tarsnap-diff.sh-foo-2026-07-27_00-02-05.log
 ```
 
-The log carries the same figures at the top, so that a `head -11` sums up the whole context for you:
+The log carries the same figures at the top, in a header whose lines start with `#`: 11 lines, or 13 when neither `-i` nor `-m` was requested, which adds a note on the indicative counters. `grep '^#'` extracts it whatever the mode:
 
 ```
-root@foo:~/tarsnap-tools# head -11 /var/log/tarsnap-diff.sh-foo-2026-08-20_00-02-02.log
+root@foo:~/tarsnap-tools# grep '^#' /var/log/tarsnap-diff.sh-foo-2026-08-20_00-02-02.log
 # tarsnap-diff.sh
 # snapshot    : foo-2026-08-20_00-02-02
 # date        : 2026-09-19 00:14:34
@@ -564,6 +617,11 @@ The operation is atomic, the log is never left truncated, but it changes the ino
 
 Do not put the log in a directory covered by `BACKUP_DIRS`: it would show up in its own diff as a new file.  
 The script warns you if you give it an absolute path that falls inside one.
+
+### Progress display
+
+When standard error is a terminal, a progress line counts the entries received while the archive is listed, then a spinner turns if files have to be downloaded.  
+Without `stdbuf`, the listing gets the plain spinner instead of the counter. Nothing is ever drawn over a passphrase prompt, and `TARSNAP_SPINNER=0` disables the whole display.
 
 ### Options and examples
 
@@ -657,57 +715,11 @@ It is also listed on [Tarsnap's helper scripts page](https://www.tarsnap.com/hel
 
 - **Creation before deletion.** Never the other way round, under any circumstances.
 - **`set -euf`.** Exit on the first error, unset variables are fatal, no globbing on unquoted expansions.
-- **`flock` lock on descriptor 9.** The Tarsnap manual forbids two concurrent create or delete operations with the same key. The lock is held by an open descriptor, so the kernel releases it when the process dies, including on `kill -9`, OOM or power failure. No stale file to clean up, and no possible race, unlike an existence test followed by a `touch`.
-- **Batch purge in a single call.** The manual allows `-f` to be repeated in `-d` mode, and Tarsnap caches the metadata, which noticeably speeds up the purge of several archives.
+- **`flock` lock on descriptor 9.** Two runs never overlap, as the Tarsnap manual requires for a given key, and the kernel releases the lock even after a `kill -9` or a power failure: no stale lock file to clean up.
+- **Batch purge in a single call.** All the archives to delete go to one `tarsnap -d`, which noticeably speeds up the purge.
 - **Strict naming pattern as a safeguard.** Anything that does not exactly match the pattern is never deleted.
 
-## Technical choices
-
-**The `prebackup` and `postbackup` functions are called bare, without any condition on their return status.**
-
-The `set -e` at the top of the script stops it on the failing command: it does not go on to create the snapshot.  
-No home-made error message, just the one from the failing command: this is much safer, because every error is caught this way.
-
-Before adding a command or a script to one of these blocks, make sure it runs correctly, by using the `--dry-run` option and checking that nothing turns up in the `cron` mail, or in `--verbose` mode.
-
----
-
-### Tarsnap's `--dry-run`, not `--dry-run-metadata`
-
-The latter, added in Tarsnap 1.0.41, would nevertheless be much faster: it reads no data, whereas `--dry-run` rereads all the files and therefore takes as long as a real backup.  
-It is ruled out because it fails as soon as the chunk cache is populated.
-
-```
-tarsnap: Programmer error: writetape_writechunk unexpectedly returned 0
-tarsnap: Error writing cached archive entry
-```
-
-Reproduced in 1.0.41 on each of the four directories of `BACKUP_DIRS` taken individually, with a `cachedir` coming from a real backup.  
-The same call against a freshly initialised `cachedir` goes through without a hitch, which isolates the cache as the only variable. Nor is it a matter of volume: `/boot` alone is enough.
-
-And `print-stats` has nothing to do with it:  
-The failure also occurs with `--no-print-stats`. Note, however, that a single file passed as an argument is not always enough to trigger the error, even if it is in the cache: the cache has to be able to provide a complete archive entry.
-
-The cause can be seen in the 1.0.41 source. `multitape_write.c:429` sets `no_chunkifiers = (dryrun == 2)`, which deprives the streams initialised on lines 517 to 521 of a chunkifier, whereas the chunk layer `d->C` is created on line 503 with no condition on `dryrun`. As a result, `writetape_ischunkpresent` answers "present" where `writetape_writechunk` returns 0, and `ccache_entry.c:409` treats that 0 as a programmer error.
-
-Do not put the option back without checking that this has been fixed upstream.  
-The command that reproduces it, read-only and on a copy of the cache:
-
-```sh
-cp -a /usr/local/tarsnap-cache /root/ts-cache-test
-tarsnap --cachedir /root/ts-cache-test --dry-run-metadata --no-print-stats -c -f zz-test /boot
-echo $?
-```
-
----
-
-**`--quiet --no-print-stats`.** These Tarsnap arguments make the script run silently, without systematically printing the statistics table at the end of each run.  
-The only time the script gets talkative is when an error occurs.
-
-**`printf` and not `echo`.** The behaviour of `echo` on a backslash or on an argument starting with `-` can vary from one shell to another, whereas `printf` raises no such issue.
-
-**Long options translated by hand.** POSIX `getopts` only knows single-character options.  
-The script rewrites the long forms into short ones before running `getopts`, with one or two dashes accepted.
+The reasons behind them, the other technical choices, the validation procedure and the ShellCheck directives are in [HACKING.md](HACKING.md).
 
 ## Known limitations
 
@@ -725,6 +737,9 @@ Elsewhere, it will refuse to start until the configuration block and the package
 Without a terminal, under `cron` for example, the script stops before `prebackup`, with an explicit message. A standard input that is not a terminal counts as no terminal: piping the passphrase in is not supported, since every invocation would read it again. To run the script through `ssh host command`, add `-t`.
 
 This check only covers the key named in `TARSNAP_KEY`. With `TARSNAP_KEY` empty, the key designated by `tarsnap.conf` is out of the script's sight, and a protected key will only fail once `prebackup` has run.
+
+**Passphrase read from a file or a variable:** since version 1.0.40, Tarsnap can read the passphrase from a file or from an environment variable, with `--passphrase`.  
+The script does not use this option, and its terminal check does not know about it: a protected key named in `TARSNAP_KEY` is refused without a terminal all the same.
 
 ## Restoring
 
