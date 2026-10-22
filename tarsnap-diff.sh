@@ -35,7 +35,11 @@
 # known once everything has been classified. The finished log can therefore
 # be read with a simple:
 #
-#     head -15 /var/log/tarsnap-diff.sh-<snapshot>.log
+#     grep '^#' /var/log/tarsnap-diff.sh-<snapshot>.log
+#
+# which keeps the header alone, since no detail line starts with "#": 11
+# lines, 13 in metadata-only mode, when the selected categories include
+# neither -i nor -m.
 #
 # This prepending is done by rewriting into a neighbouring file and then
 # renaming it: the operation is atomic, but it changes the inode, so a
@@ -98,10 +102,10 @@
 #
 ###############################################################################
 #
-# BACKUP_DIRS, BACKUP_EXCLUDE and TARSNAP_KEY are read from tarsnap-backup.sh,
-# which is NEVER sourced, only read with sed: sourcing it would trigger its
-# option parsing, its lock and, in the end, a real backup. Same precaution
-# and same search order as rotation-check.sh.
+# BACKUP_DIRS, BACKUP_EXCLUDE, TARSNAP_KEY and TARSNAP_PASSPHRASE are read
+# from tarsnap-backup.sh, which is NEVER sourced, only read with sed:
+# sourcing it would trigger its option parsing, its lock and, in the end, a
+# real backup. Same precaution and same search order as rotation-check.sh.
 #
 # BACKUP_EXCLUDE can be overridden with -e. This is useful because the
 # exclusions in force when the snapshot was taken cannot be reconstructed:
@@ -217,7 +221,8 @@ $_pad [-l log] [-f script] [--debug] SNAPSHOT
   -l, --log FILE        path of the log
                         (default: $LOG_DIR/${0##*/}-SNAPSHOT.log)
   -f, --file SCRIPT     path of tarsnap-backup.sh, from which BACKUP_DIRS,
-                        BACKUP_EXCLUDE and TARSNAP_KEY are read
+                        BACKUP_EXCLUDE, TARSNAP_KEY and TARSNAP_PASSPHRASE
+                        are read
       --debug           trace the execution (set -x), and keep the
                         temporary directory, whose path is displayed
   -h, --help            display this help
@@ -361,16 +366,23 @@ fi
 # is the documented "I rely on tarsnap.conf" case. Hence the preliminary
 # grep, which tells "declared and empty" from "not declared at all", where
 # a silent sed would confuse the two.
+#
+# The value stops at the first double quote after the opening one, so that
+# a trailing comment may contain double quotes of its own, as in
+#   TARSNAP_KEY="/root/tarsnap.key" # see "keyfile"
+# The value itself can therefore hold no double quote, which none of the
+# variables read here needs.
 read_string() {
     _name=$1
     "$GREP_BIN" -q "^${_name}=\"" "$BACKUP_SCRIPT" \
         || die "variable $_name not found in $BACKUP_SCRIPT"
-    "$SED_BIN" -n "/^${_name}=/{s/^${_name}=\"\(.*\)\".*/\1/p;q;}" "$BACKUP_SCRIPT"
+    "$SED_BIN" -n "/^${_name}=/{s/^${_name}=\"\([^\"]*\)\".*/\1/p;q;}" "$BACKUP_SCRIPT"
 }
 
 TARSNAP_KEY=$(read_string TARSNAP_KEY)
 BACKUP_DIRS=$(read_string BACKUP_DIRS)
 BACKUP_EXCLUDE=$(read_string BACKUP_EXCLUDE)
+TARSNAP_PASSPHRASE=$(read_string TARSNAP_PASSPHRASE)
 
 if [ -n "$OPT_EXCLUDE" ]; then
     BACKUP_EXCLUDE=$OPT_EXCLUDE
@@ -380,6 +392,7 @@ fi
 dbg "BACKUP_SCRIPT=$BACKUP_SCRIPT"
 dbg "BACKUP_DIRS=$BACKUP_DIRS"
 dbg "BACKUP_EXCLUDE=$BACKUP_EXCLUDE"
+dbg "TARSNAP_PASSPHRASE=$TARSNAP_PASSPHRASE"
 
 ###############################################################################
 # SAFEGUARDS
@@ -398,6 +411,39 @@ done
 if [ "$STRICT" -eq 1 ] && [ "$NEED_BYTE_CHECK" -eq 0 ]; then
     printf 'WARNING: -S has no effect here, since neither -i nor -m is requested.\n' >&2
 fi
+
+# TARSNAP_KEY and TARSNAP_PASSPHRASE end up in TARSNAP_KEYOPT, expanded
+# unquoted so that the options vanish when empty (see below): a blank
+# would split a value into two arguments. Refused here, rather than
+# quoting every tarsnap call, as in tarsnap-backup.sh.
+case "$TARSNAP_KEY" in
+    *[[:space:]]*)
+        die "TARSNAP_KEY must not contain whitespace, see $BACKUP_SCRIPT:" \
+            "$TARSNAP_KEY" ;;
+esac
+case "$TARSNAP_PASSPHRASE" in
+    *[[:space:]]*)
+        die "TARSNAP_PASSPHRASE must not contain whitespace, see" \
+            "$BACKUP_SCRIPT: $TARSNAP_PASSPHRASE" ;;
+esac
+
+# The passphrase method must be one that tarsnap understands, otherwise it
+# would stop on "Cannot parse passphrase entry method", at the listing.
+# The name of an env: variable is checked once and for all, since
+# passphrase_reachable() hands it to eval: an explicit list rather than a
+# range such as [A-Za-z], whose content depends on the locale. Same lists
+# as in tarsnap-backup.sh.
+case "$TARSNAP_PASSPHRASE" in
+    ""|dev:tty-stdin|dev:tty-once|dev:stdin-once|env:[!0-9]*|file:?*) ;;
+    *)
+        die "invalid TARSNAP_PASSPHRASE, see $BACKUP_SCRIPT:" \
+            "$TARSNAP_PASSPHRASE" ;;
+esac
+case "$TARSNAP_PASSPHRASE" in
+    env:*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_]*)
+        die "invalid variable name in TARSNAP_PASSPHRASE, see" \
+            "$BACKUP_SCRIPT: $TARSNAP_PASSPHRASE" ;;
+esac
 
 if [ -n "$TARSNAP_KEY" ] && [ ! -r "$TARSNAP_KEY" ]; then
     die "tarsnap key not readable: $TARSNAP_KEY"
@@ -443,15 +489,140 @@ key_is_passphrased() {
     return 1
 }
 
-# KEY_MAY_PROMPT=1 when tarsnap may ask for a passphrase: protected key,
-# or empty TARSNAP_KEY, since the key designated by tarsnap.conf is then
-# out of sight and the script plays it safe. Each tarsnap invocation reads
-# the key again, hence asks again: once for the listing, once more if
-# files have to be downloaded.
-if [ -z "$TARSNAP_KEY" ] || key_is_passphrased "$TARSNAP_KEY"; then
-    KEY_MAY_PROMPT=1
+# Can tarsnap obtain the passphrase of a protected key, with the method of
+# TARSNAP_PASSPHRASE? Mirrors tarsnap 1.0.41, method by method: readpass()
+# of libcperciva reads /dev/tty then stdin for dev:tty-stdin (devtty 1),
+# stdin only for dev:stdin-once (devtty 0) and /dev/tty only for
+# dev:tty-once (devtty 2); env: calls getenv(); file: calls
+# readpass_file(), which wants a single line and strips its CR or LF.
+# An empty variable or file is refused as well: tarsnap would read an
+# empty passphrase and fail on it, later on. A file that is not a
+# regular one (FIFO, device) is only checked for readability, so as not
+# to consume it. Sets PASSPHRASE_HOW for the verbose message and
+# PASSPHRASE_WHY for the error message. TARSNAP_PASSPHRASE has been
+# validated beforehand: the eval only ever sees a valid variable name.
+passphrase_reachable() {
+    case "$TARSNAP_PASSPHRASE" in
+        ""|dev:tty-stdin)
+            PASSPHRASE_HOW="tarsnap will ask for it on each call"
+            PASSPHRASE_WHY="no terminal to type the passphrase"
+            ( exec </dev/tty ) 2>/dev/null || [ -t 0 ]
+            ;;
+        dev:tty-once)
+            PASSPHRASE_HOW="tarsnap will ask for it on /dev/tty on each call"
+            PASSPHRASE_WHY="dev:tty-once and no /dev/tty"
+            ( exec </dev/tty ) 2>/dev/null
+            ;;
+        dev:stdin-once)
+            PASSPHRASE_HOW="tarsnap will ask for it on stdin on each call"
+            PASSPHRASE_WHY="dev:stdin-once and stdin is not a terminal"
+            [ -t 0 ]
+            ;;
+        env:*)
+            _pp_name=${TARSNAP_PASSPHRASE#env:}
+            PASSPHRASE_HOW="read from the environment variable $_pp_name"
+            PASSPHRASE_WHY="environment variable $_pp_name unset or empty"
+            _pp_value=""
+            eval "_pp_value=\${$_pp_name-}"
+            [ -n "$_pp_value" ]
+            ;;
+        file:*)
+            _pp_file=${TARSNAP_PASSPHRASE#file:}
+            PASSPHRASE_HOW="read from $_pp_file"
+            PASSPHRASE_WHY="passphrase file $_pp_file unreadable,"
+            PASSPHRASE_WHY="$PASSPHRASE_WHY empty or not a single line"
+            [ -r "$_pp_file" ] || return 1
+            [ -f "$_pp_file" ] || return 0
+            [ -s "$_pp_file" ] &&
+                [ "$("$SED_BIN" -n '$=' "$_pp_file")" = 1 ]
+            ;;
+    esac
+}
+
+# Key designated by tarsnap.conf, for when TARSNAP_KEY is empty: tarsnap
+# itself is asked. --dump-config alone switches tarsnap to its
+# --verify-config mode, which exits before loading the key (tarsnap 1.0.41,
+# tar/bsdtar.c), so without a passphrase prompt and without network access.
+# It prints on stderr, in reading order, the command line, then a "Reading
+# from config file:" header for each file tried, followed by the option
+# lines of that file, leading blanks stripped, indented by two spaces. The
+# first keyfile wins, hence the first "  keyfile" line after the first
+# header. Prints that path, or prints nothing and returns 1 when the answer
+# is not reliable: non-zero exit (tarsnap older than 1.0.40, invalid
+# configuration), no keyfile line, an argument starting with "~" (tarsnap
+# expands it with the home directory of the password database, not $HOME,
+# and this script does not read that database), or an argument containing
+# a blank (kept by tarsnap, with a warning).
+conf_keyfile() {
+    _ck_dump=$("$TARSNAP_BIN" --dump-config 2>&1 >/dev/null) || return 1
+    _ck_key=$(printf '%s\n' "$_ck_dump" | "$SED_BIN" -n \
+        -e '1,/^Reading from config file: /d' \
+        -e '/^  keyfile[[:space:]]/!d' \
+        -e 's/^  keyfile[[:space:]]*//p' -e 'q')
+    case "$_ck_key" in
+        ""|"~"*|*[[:space:]]*) return 1 ;;
+    esac
+    printf '%s\n' "$_ck_key"
+}
+
+# The key whose passphrase matters is TARSNAP_KEY, or else the key that
+# tarsnap.conf designates, as tarsnap itself reports it, see conf_keyfile().
+# An unreadable key of tarsnap.conf is left to tarsnap, which names it in
+# its own error message. Same reading as tarsnap-backup.sh.
+CONF_KEY=""
+if [ -z "$TARSNAP_KEY" ]; then
+    CONF_KEY=$(conf_keyfile) || CONF_KEY=""
+    if [ -n "$CONF_KEY" ] && [ ! -r "$CONF_KEY" ]; then
+        CONF_KEY=""
+    fi
+fi
+if [ -n "$CONF_KEY" ]; then
+    say "Key from tarsnap.conf: $CONF_KEY."
+    KEY_EFF=$CONF_KEY
+    KEY_WHERE="$CONF_KEY (from tarsnap.conf)"
 else
-    KEY_MAY_PROMPT=0
+    KEY_EFF=$TARSNAP_KEY
+    KEY_WHERE=$TARSNAP_KEY
+fi
+
+# A protected key whose passphrase cannot be obtained is refused here,
+# before the log is opened: the listing would fail anyway on the first
+# tarsnap call, and the previous log of the same snapshot would already
+# have been emptied. When the key stays out of sight, only an env: or
+# file: method is checked, as in tarsnap-backup.sh: it was set for a
+# protected key.
+#
+# KEY_MAY_PROMPT=1 when tarsnap may ask for the passphrase on the terminal,
+# so that the display keeps out of its way (spinner, stderr of the
+# download): a protected key with a dev: method or the default one, or a
+# key out of sight without env: or file:, the script then playing it safe.
+# tarsnap only reads the passphrase to decrypt a key: a plain key never
+# prompts, whatever the method. Each tarsnap invocation reads the key
+# again, hence asks again: once for the listing, once more if files have
+# to be downloaded.
+if [ -n "$KEY_EFF" ]; then
+    if key_is_passphrased "$KEY_EFF"; then
+        if passphrase_reachable; then
+            say "Passphrase-protected key: $PASSPHRASE_HOW."
+        else
+            die "passphrase-protected key, $PASSPHRASE_WHY: $KEY_WHERE"
+        fi
+        case "$TARSNAP_PASSPHRASE" in
+            env:*|file:*) KEY_MAY_PROMPT=0 ;;
+            *)            KEY_MAY_PROMPT=1 ;;
+        esac
+    else
+        KEY_MAY_PROMPT=0
+    fi
+else
+    case "$TARSNAP_PASSPHRASE" in
+        env:*|file:*)
+            passphrase_reachable ||
+                die "$PASSPHRASE_WHY (key from tarsnap.conf)"
+            KEY_MAY_PROMPT=0 ;;
+        *)
+            KEY_MAY_PROMPT=1 ;;
+    esac
 fi
 dbg "KEY_MAY_PROMPT=$KEY_MAY_PROMPT"
 
@@ -462,6 +633,13 @@ if [ -n "$TARSNAP_KEY" ]; then
     TARSNAP_KEYOPT="--keyfile $TARSNAP_KEY"
 else
     TARSNAP_KEYOPT=""
+fi
+
+# The passphrase method rides along with the key, as in tarsnap-backup.sh:
+# TARSNAP_KEYOPT reaches both tarsnap calls, the listing and the download.
+if [ -n "$TARSNAP_PASSPHRASE" ]; then
+    TARSNAP_KEYOPT="${TARSNAP_KEYOPT:+$TARSNAP_KEYOPT }--passphrase"
+    TARSNAP_KEYOPT="$TARSNAP_KEYOPT $TARSNAP_PASSPHRASE"
 fi
 
 # --- Opening the log ---
@@ -475,13 +653,25 @@ case "$LOGFILE" in
     *)   LOGDIR_EFF="." ;;
 esac
 [ -d "$LOGDIR_EFF" ] || die "log directory does not exist: $LOGDIR_EFF"
-: > "$LOGFILE" || die "log not writable: $LOGFILE"
+[ ! -d "$LOGFILE" ] || die "log path is a directory: $LOGFILE"
 
-# Working file for the final prepending, next to the log so that the
-# rename stays within the same file system, hence atomic. Declared here
-# because cleanup() must be able to remove it, and set -u would kill the
-# script on a variable still undefined at the time of a signal.
-LOGFILE_TMP="${LOGFILE}.$$.tmp"
+# The log is created by mktemp next to its final path, then renamed onto
+# it, rather than opened in place: with -l pointing into a directory that
+# everyone can write to, /tmp for instance, a symbolic link planted
+# beforehand under the name of the log would be followed, whereas
+# rename() replaces it. The log is thus in mode 0600 from the start, like
+# its final version, see step 6.
+_log_new=$("$MKTEMP_BIN" "${LOGFILE}.XXXXXXXX") \
+    || die "log not writable: $LOGFILE"
+"$MV_BIN" -f "$_log_new" "$LOGFILE" \
+    || { "$RM_BIN" -f "$_log_new"; die "log not writable: $LOGFILE"; }
+
+# Working file for the final prepending, created by mktemp in step 6, next
+# to the log so that the rename stays within the same file system, hence
+# atomic. Declared here, empty, because cleanup() must be able to test it,
+# and set -u would kill the script on a variable still undefined at the
+# time of a signal.
+LOGFILE_TMP=""
 
 # Timestamp taken at the START and kept: the header is only written at the
 # end, but it is indeed the launch time that interests you, not the time
@@ -510,9 +700,11 @@ SPINNER_PID=""
 # Idempotent cleanup: the HUP, INT and TERM handlers go through it a
 # second time via the EXIT trap, which has no effect.
 #
-# SC2317 is disabled here: shellcheck does not follow calls made from a
-# trap and therefore believes the whole body is dead. It is not.
-# shellcheck disable=SC2317
+# SC2317 and SC2329 are disabled here: shellcheck does not follow calls
+# made from a trap, and therefore believes the whole body is dead (SC2317)
+# or the function never invoked (SC2329, from ShellCheck 0.11.0 on). It is
+# not.
+# shellcheck disable=SC2317,SC2329
 cleanup() {
     if [ -n "$SPINNER_PID" ]; then
         kill "$SPINNER_PID" 2>/dev/null || true
@@ -996,6 +1188,14 @@ fi
 # rename is atomic, so the log is never left truncated, even if the
 # machine goes down during the operation.
 exec 3>&-
+
+# mktemp rather than a name derived from the PID: with -l pointing into a
+# directory that everyone can write to, /tmp for instance, a predictable
+# name could be planted beforehand, as a symbolic link or as a file owned
+# by someone else. mktemp creates the file itself, under a random name and
+# with O_EXCL, in mode 0600: the log keeps that mode once renamed.
+LOGFILE_TMP=$("$MKTEMP_BIN" "${LOGFILE}.XXXXXXXX") \
+    || die "cannot create a working file next to the log: $LOGFILE"
 
 {
     printf '# %s\n'                    "${0##*/}"
