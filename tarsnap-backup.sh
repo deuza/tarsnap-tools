@@ -365,6 +365,32 @@ passphrase_reachable() {
     esac
 }
 
+# Key designated by tarsnap.conf, for when TARSNAP_KEY is empty: tarsnap
+# itself is asked. --dump-config alone switches tarsnap to its
+# --verify-config mode, which exits before loading the key (tarsnap 1.0.41,
+# tar/bsdtar.c), so without a passphrase prompt and without network access.
+# It prints on stderr, in reading order, the command line, then a "Reading
+# from config file:" header for each file tried, followed by the option
+# lines of that file, leading blanks stripped, indented by two spaces. The
+# first keyfile wins, hence the first "  keyfile" line after the first
+# header. Prints that path, or prints nothing and returns 1 when the answer
+# is not reliable: non-zero exit (tarsnap older than 1.0.40, invalid
+# configuration), no keyfile line, an argument starting with "~" (tarsnap
+# expands it with the home directory of the password database, not $HOME,
+# and this script does not read that database), or an argument containing
+# a blank (kept by tarsnap, with a warning).
+conf_keyfile() {
+    _ck_dump=$("$TARSNAP_BIN" --dump-config 2>&1 >/dev/null) || return 1
+    _ck_key=$(printf '%s\n' "$_ck_dump" | "$SED_BIN" -n \
+        -e '1,/^Reading from config file: /d' \
+        -e '/^  keyfile[[:space:]]/!d' \
+        -e 's/^  keyfile[[:space:]]*//p' -e 'q')
+    case "$_ck_key" in
+        ""|"~"*|*[[:space:]]*) return 1 ;;
+    esac
+    printf '%s\n' "$_ck_key"
+}
+
 # POSIX getopts only knows single-character options: the long forms are
 # translated before running it, with one or two dashes accepted.
 for arg do
@@ -478,12 +504,14 @@ fi
 # passphrase piped into it: each tarsnap invocation, and the commands of
 # prebackup, would read that same stdin.
 #
-# With TARSNAP_KEY empty, the key designated by tarsnap.conf is out of
-# sight: only an env: or file: method is checked, below, and a protected
-# key asked on the terminal still fails later, after prebackup.
-# tarsnap-diff.sh then assumes that the key may prompt, which only costs it
-# some display; here, the same assumption would block every cron job whose
-# plain key is declared in tarsnap.conf.
+# With TARSNAP_KEY empty, tarsnap itself is asked which key tarsnap.conf
+# designates, see conf_keyfile(), and that key goes through the same check,
+# below. When the answer is not reliable, the key stays out of sight: only
+# an env: or file: method is then checked, and a protected key asked on
+# the terminal still fails later, after prebackup. tarsnap-diff.sh assumes
+# in that case that the key may prompt, which only costs it some display;
+# here, the same assumption would block every cron job whose plain key is
+# declared in tarsnap.conf.
 if [ -n "$TARSNAP_KEY" ] && key_is_passphrased "$TARSNAP_KEY"; then
     if passphrase_reachable; then
         say "Passphrase-protected key: $PASSPHRASE_HOW."
@@ -493,11 +521,34 @@ if [ -n "$TARSNAP_KEY" ] && key_is_passphrased "$TARSNAP_KEY"; then
     fi
 fi
 
-# An env: or file: method with the key of tarsnap.conf: it was set for a
-# protected key, so it is checked as well, rather than failing after
-# prebackup. With a plain key known to the script, nothing is checked:
-# tarsnap only reads the passphrase to decrypt a key.
+# The key of tarsnap.conf, when tarsnap gives it reliably and it is
+# readable: same check as for TARSNAP_KEY. An unreadable key is left to
+# tarsnap, which names it in its own error message: refusing here would
+# rest on a reading of tarsnap.conf that might be wrong.
+CONF_KEY=""
 if [ -z "$TARSNAP_KEY" ]; then
+    CONF_KEY=$(conf_keyfile) || CONF_KEY=""
+    if [ -n "$CONF_KEY" ] && [ ! -r "$CONF_KEY" ]; then
+        CONF_KEY=""
+    fi
+fi
+if [ -n "$CONF_KEY" ]; then
+    say "Key from tarsnap.conf: $CONF_KEY."
+    if key_is_passphrased "$CONF_KEY"; then
+        if passphrase_reachable; then
+            say "Passphrase-protected key: $PASSPHRASE_HOW."
+        else
+            die "passphrase-protected key, $PASSPHRASE_WHY:" \
+                "$CONF_KEY (from tarsnap.conf)"
+        fi
+    fi
+fi
+
+# An env: or file: method with the key of tarsnap.conf out of sight: it was
+# set for a protected key, so it is checked as well, rather than failing
+# after prebackup. With a plain key known to the script, nothing is
+# checked: tarsnap only reads the passphrase to decrypt a key.
+if [ -z "$TARSNAP_KEY" ] && [ -z "$CONF_KEY" ]; then
     case "$TARSNAP_PASSPHRASE" in
         env:*|file:*)
             passphrase_reachable ||
