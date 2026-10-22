@@ -408,11 +408,37 @@ fi
 # encrypted and with "tarsnap\0" otherwise: this is the format described,
 # and the very test made, in lib/keyfile/keyfile.c of tarsnap. In base64,
 # "scrypt" gives exactly the first 8 characters of the first data line,
-# "c2NyeXB0": no decoding needed.
+# "c2NyeXB0": no decoding needed. A raw binary key file (first byte 0x00
+# or 0xff) is never encrypted: that byte is neither "#", nor a blank, nor
+# "c", so the first line sed reads is the one tested, and it never
+# matches, which is the verdict of keyfile_read().
+#
+# sed returns a verdict, the fixed word "scrypt" or nothing, never the line
+# itself, so the NUL bytes of a raw key no longer reach the shell. They
+# used to: bash warned "ignored null byte in input", into the cron mail,
+# and both shells dropped them before the test. s/.*/scrypt/ would not do:
+# in a UTF-8 locale, "." does not match an invalid byte such as 0xff, the
+# rest of the line would still come out, and the locale here is the
+# caller's. i\ writes its own text and nothing of the line. POSIX joins
+# the -e pieces with newlines, which puts that text on its own line;
+# SC1003 is a false alarm, the backslash belongs to i\ and escapes nothing
+# in the shell. The errors of sed stay visible: an unreadable file shows its
+# message and counts as not protected. POSIX only specifies sed on text
+# files: a raw key relies on GNU sed, as it always has.
+#
+# Known limitation: keyfile.c also takes a lone CR as an end of line. sed
+# then sees a single line, which starts with "# START OF TARSNAP KEY FILE"
+# and is skipped as a comment: such a protected key is reported as not
+# protected. tarsnap-keygen and tarsnap-keymgmt write LF, and CRLF is
+# handled.
+#
+# Kept identical to the function of the same name in tarsnap-backup.sh.
 key_is_passphrased() {
-    _first=$("$SED_BIN" -n '/^#/d; /^[[:space:]]*$/d; p; q' "$1")
-    case "$_first" in
-        c2NyeXB0*) return 0 ;;
+    # shellcheck disable=SC1003
+    _verdict=$("$SED_BIN" -n -e '/^#/d; /^[[:space:]]*$/d' \
+        -e '/^c2NyeXB0/i\' -e 'scrypt' -e 'q' "$1")
+    case "$_verdict" in
+        scrypt) return 0 ;;
     esac
     return 1
 }
