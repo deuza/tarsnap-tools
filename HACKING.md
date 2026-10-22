@@ -12,6 +12,7 @@ Using the suite only requires the [README](README.md).
 - [Validation](#validation)
 - [ShellCheck directives](#shellcheck-directives)
 - [Technical choices](#technical-choices)
+- [Passphrase and key detection](#passphrase-and-key-detection)
 - [The `--dry-run-metadata` bug](#the---dry-run-metadata-bug)
 
 ## Repository layout
@@ -37,6 +38,7 @@ A change that breaks one of these is a regression, whatever it gains elsewhere.
 - **Batch purge in a single call.** Every archive to delete goes to one `tarsnap -d`, with `-f` repeated.
 - **Strict naming pattern as the only purge scope.** Only names that exactly match `hostname-YYYY-MM-DD_HH-MM-SS` can be deleted: `.part` archives, snapshots taken with `-s` and every other name stay out of reach.
 - **`tarsnap-backup.sh` is never sourced** by the companion tools, only read: sourcing it would run its option parsing, take its lock and, in the end, make a real backup.
+- **Shared functions stay identical.** `key_is_passphrased()`, `passphrase_reachable()` and `conf_keyfile()` have the same body, byte for byte, in `tarsnap-backup.sh` and in `tarsnap-diff.sh`: see [Passphrase and key detection](#passphrase-and-key-detection).
 - **Read-only modes take no lock.** `--orphans` and `tarsnap-diff.sh` only list or extract, which the Tarsnap manual allows in parallel with any other operation. `rotation-check.sh` does not run Tarsnap at all.
 - **No code is removed for the sake of optimisation.** A line that looks redundant is often the trace of a bug that was fixed: removing it is a change of its own, with its own justification.
 
@@ -47,14 +49,15 @@ A change that breaks one of these is a regression, whatever it gains elsewhere.
 | Variables | Read by | Expected form |
 |---|---|---|
 | `DAILY`, `WEEKLY`, `MONTHLY`, `DOW`, `DOM` | `rotation-check.sh` | `NAME=` followed by digits, unquoted |
-| `TARSNAP_KEY`, `BACKUP_DIRS`, `BACKUP_EXCLUDE` | `tarsnap-diff.sh` | `NAME="..."`, possibly empty |
+| `TARSNAP_KEY`, `TARSNAP_PASSPHRASE`, `BACKUP_DIRS`, `BACKUP_EXCLUDE` | `tarsnap-diff.sh` | `NAME="..."`, possibly empty, no double quote inside |
 
 Hence:
 
 - Renaming one of these variables breaks the tool that reads it.
 - Only the first line starting with `NAME=` counts, whereas the shell keeps the last assignment: a second definition further down would make the tools and the backup disagree.
 - The value is taken literally: no `$VARIABLE` expansion, and no quoting other than the one above.
-- A trailing comment on a string line must not contain a double quote: `read_string` captures everything up to the last `"` of the line.
+- A string value stops at the first double quote after the opening one: a trailing comment may contain double quotes, the value itself cannot.
+- A missing variable stops the tool that reads it: `tarsnap-diff.sh` therefore needs a `tarsnap-backup.sh` that already has `TARSNAP_PASSPHRASE`, and stops with `variable TARSNAP_PASSPHRASE not found` otherwise.
 
 Both tools look for `/usr/local/sbin/tarsnap-backup.sh` first, then for a `tarsnap-backup.sh` in their own directory, unless `-f` names another one.
 
@@ -65,22 +68,27 @@ Every change to a script goes through the following, run from the root of the re
 ```sh
 for f in *.sh; do sh -n "$f" && dash -n "$f" && bash -n "$f" || echo "FAILED: $f"; done
 shellcheck -s sh *.sh
+for fn in key_is_passphrased passphrase_reachable conf_keyfile; do
+    b=$(sed -n "/^$fn() {/,/^}/p" tarsnap-backup.sh)
+    d=$(sed -n "/^$fn() {/,/^}/p" tarsnap-diff.sh)
+    [ -n "$b" ] && [ "$b" = "$d" ] || echo "DIFFERENT OR MISSING: $fn"
+done
 ```
 
-Both commands print nothing when everything is in order. Each mode touched by the change is then run for real, under `dash` and under `bash`, and the documentation is updated in the same commit.
+All three print nothing when everything is in order. The third one compares the bodies of the functions shared by `tarsnap-backup.sh` and `tarsnap-diff.sh`, see [Passphrase and key detection](#passphrase-and-key-detection). Each mode touched by the change is then run for real, under `dash` and under `bash`, and the documentation is updated in the same commit.
 
-ShellCheck 0.9.0 (Debian Bookworm) and 0.10.0 (Debian Trixie) report nothing. ShellCheck 0.11.0, shipped in trixie-backports and in Forky, also reports SC2329 on `cleanup()` in `tarsnap-diff.sh`: see SC2317 below.
+ShellCheck 0.9.0 (Debian Bookworm), 0.10.0 (Debian Trixie) and 0.11.0 (trixie-backports, Forky) report nothing.
 
 ## ShellCheck directives
 
-Each directive sits right above the command it covers, with its reason in a comment. There are thirteen of them, for five codes.
+Each directive sits right above the command it covers, with its reason in a comment. There are thirteen of them, for six codes.
 
 | Code | Where | Why |
 |---|---|---|
-| SC2086 | `tarsnap-backup.sh`: archive listing in `list_orphans()` and in the rotation, creation, purge. `tarsnap-diff.sh`: archive listing and extraction, two branches each | `$TARSNAP_KEYOPT` and `$TARSNAP_MSGOPT` must vanish from the command line when they are empty, and `$BACKUP_DIRS` is a list. `set -f` rules out globbing. As a consequence, neither the key path nor the entries of `BACKUP_DIRS` may contain whitespace. |
+| SC2086 | `tarsnap-backup.sh`: archive listing in `list_orphans()` and in the rotation, creation, purge. `tarsnap-diff.sh`: archive listing and extraction, two branches each | `$TARSNAP_KEYOPT`, which carries `--keyfile` and `--passphrase`, and `$TARSNAP_MSGOPT` must vanish from the command line when they are empty, and `$BACKUP_DIRS` is a list. `set -f` rules out globbing. As a consequence, neither the key path, nor the passphrase method, nor the entries of `BACKUP_DIRS` may contain whitespace: both scripts refuse a blank in `TARSNAP_KEY` and `TARSNAP_PASSPHRASE` before their first Tarsnap call. |
 | SC1003 | `key_is_passphrased()`, in both scripts | The backslash belongs to the `i\` command of `sed`: it escapes nothing in the shell. |
 | SC2046 | `rotation-check.sh`, replay mode | `set -- $(date ...)` is meant to split the three fields printed by `date`. |
-| SC2317 | `tarsnap-diff.sh`, `cleanup()` | The function is only called from the traps, which ShellCheck does not follow, so it believes the body is unreachable. ShellCheck 0.11.0 reports the same situation as SC2329, which the directive does not list yet. |
+| SC2317, SC2329 | `tarsnap-diff.sh`, `cleanup()` | The function is only called from the traps, which ShellCheck does not follow: it believes the body unreachable (SC2317) or, from ShellCheck 0.11.0 on, the function never invoked (SC2329). A single directive covers both codes. |
 | SC2254 | `tarsnap-diff.sh`, `is_excluded()` | The unquoted pattern is the exclusion glob itself: it has to be interpreted, not matched literally. |
 
 ## Technical choices
@@ -105,9 +113,36 @@ Each directive sits right above the command it covers, with its reason in a comm
 
 **`tarsnap-diff.sh`: `LC_ALL=C` on `sort` and `join`.** `join` silently misbehaves when the collation order of its inputs is not its own. `sort -u` on the key also guards against a path present twice, which would otherwise produce the Cartesian product of the duplicates.
 
-**`tarsnap-diff.sh`: the header of the log.** It carries the counters, so it can only be written last: it is built in a file next to the log, followed by the accumulated details, then renamed over the log. The rename stays within the same file system, hence it is atomic.
+**`tarsnap-diff.sh`: the header of the log.** It carries the counters, so it can only be written last: it is built in a working file that `mktemp` creates next to the log, followed by the accumulated details, then renamed over the log. The rename stays within the same file system, hence it is atomic.
 
-**Passphrase detection.** `key_is_passphrased()` follows `lib/keyfile/keyfile.c` of Tarsnap: once comments and blank lines are skipped, the base64 of an encrypted key starts with `c2NyeXB0`, the encoding of `scrypt`, so no decoding is needed. `sed` returns a fixed verdict rather than the line, so the NUL bytes of a raw binary key never reach the shell. Known limitation: a key file whose lines end with a lone CR is seen as a single comment line, hence reported as not protected; `tarsnap-keygen` and `tarsnap-keymgmt` write LF, and CRLF is handled. The function exists in `tarsnap-backup.sh` and in `tarsnap-diff.sh`, and must stay identical in both.
+**`tarsnap-diff.sh`: log files created by `mktemp`.** The log is not opened in place: it is created by `mktemp` next to its final path, then renamed onto it. With `-l` pointing into a directory that everyone can write to, `/tmp` for instance, a symbolic link planted beforehand under the name of the log would be followed by an opening in place, whereas `rename()` replaces it. The working file of the header gets a random name for the same reason, created with `O_EXCL`: a predictable name could be planted beforehand, as a link or as a file owned by someone else. Both files are in mode 0600, so the log keeps that mode from start to finish.
+
+## Passphrase and key detection
+
+Three functions exist in `tarsnap-backup.sh` and in `tarsnap-diff.sh`, and must keep the same body, byte for byte: the third command of [Validation](#validation) checks it. Only the comments above them are adapted to each script.
+
+**`key_is_passphrased()`** follows `lib/keyfile/keyfile.c` of Tarsnap: once comments and blank lines are skipped, the base64 of an encrypted key starts with `c2NyeXB0`, the encoding of `scrypt`, so no decoding is needed. `sed` returns a fixed verdict rather than the line, so the NUL bytes of a raw binary key never reach the shell. Known limitation: a key file whose lines end with a lone CR is seen as a single comment line, hence reported as not protected; `tarsnap-keygen` and `tarsnap-keymgmt` write LF, and CRLF is handled.
+
+**`passphrase_reachable()`** tells whether Tarsnap can obtain the passphrase of a protected key with the method of `TARSNAP_PASSPHRASE`, mirroring Tarsnap 1.0.41 method by method:
+
+| Method | Tarsnap reads | Checked here |
+|---|---|---|
+| empty, `dev:tty-stdin` | `/dev/tty`, then standard input, through `readpass()` | `/dev/tty` opens, or standard input is a terminal |
+| `dev:tty-once` | `/dev/tty` only | `/dev/tty` opens |
+| `dev:stdin-once` | standard input only | standard input is a terminal |
+| `env:NAME` | the variable, through `getenv()` | the variable is set and not empty |
+| `file:PATH` | a single line, CR or LF stripped, through `readpass_file()` | the file is readable and holds a single non-empty line |
+
+`/dev/tty` is really opened, rather than tested with `[ -r ]`. An empty variable or file is refused as well: Tarsnap would read an empty passphrase and fail on it, later. A file that is not a regular one, a FIFO or a device, is only checked for readability, so as not to consume it. The function sets `PASSPHRASE_HOW` for the verbose message and `PASSPHRASE_WHY` for the error message. Its `eval` only ever sees a variable name validated beforehand, against an explicit list of characters rather than a range such as `[A-Za-z]`, whose content depends on the locale.
+
+**`conf_keyfile()`** asks Tarsnap which key `tarsnap.conf` designates, when `TARSNAP_KEY` is empty. `--dump-config` alone switches Tarsnap to its `--verify-config` mode, which exits before loading the key (`tar/bsdtar.c`, 1.0.41): no passphrase prompt and no network access. The function relies on this output:
+
+- everything on standard error, nothing on standard output, exit status 0;
+- the command line first, then a `Reading from config file:` header for each file tried, even a missing one, in reading order, `--configfile` first;
+- after each header, the option lines of that file, leading blanks stripped, indented by two spaces;
+- the first value wins, hence the first `  keyfile` line after the first header.
+
+The key stays unknown when this answer is not reliable: a non-zero exit (Tarsnap older than 1.0.40, invalid configuration), no `keyfile` line, an argument starting with `~`, which Tarsnap expands from the password database and not from `$HOME`, or an argument containing a blank, which Tarsnap keeps with a warning. Both scripts then only check an `env:` or `file:` method.
 
 ## The `--dry-run-metadata` bug
 

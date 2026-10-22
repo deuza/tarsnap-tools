@@ -215,8 +215,8 @@ Only errors and warnings go to standard error, hence into the `cron` mail, or el
 
 Everything is set in the block at the top of the file, between `CONFIGURATION` and `END OF CONFIGURATION`.
 
-`rotation-check.sh` and `tarsnap-diff.sh` read part of this block as plain text, without ever running the file: the five retention values, `TARSNAP_KEY`, `BACKUP_DIRS` and `BACKUP_EXCLUDE`.  
-Keep the shipped layout for these: one line each, starting with the name and defined only once, integers without quotes, strings between double quotes, no `$VARIABLE`, and no trailing comment containing a double quote.  
+`rotation-check.sh` and `tarsnap-diff.sh` read part of this block as plain text, without ever running the file: the five retention values, `TARSNAP_KEY`, `TARSNAP_PASSPHRASE`, `BACKUP_DIRS` and `BACKUP_EXCLUDE`.  
+Keep the shipped layout for these: one line each, starting with the name and defined only once, integers without quotes, strings between double quotes with none inside, and no `$VARIABLE`.  
 Renaming one of them breaks the tool that reads it: see [HACKING.md](HACKING.md#configuration-read-by-the-companion-tools).
 
 ### Binary paths
@@ -228,8 +228,33 @@ The shipped values are those of Debian with `usrmerge`, hence everything under `
 
 ### Tarsnap
 
-`TARSNAP_KEY`: the path of the Tarsnap key, which must not contain whitespace. Leave the variable empty to rely on the `keyfile` declared in `tarsnap.conf`, at the cost of the passphrase check (see [Known limitations](#known-limitations)).  
+`TARSNAP_KEY`: the path of the Tarsnap key, which must not contain whitespace. Leave the variable empty to rely on the `keyfile` declared in `tarsnap.conf`: the script then asks Tarsnap which key that is, through `tarsnap --dump-config`, and checks it in the same way, except in the cases listed under [Known limitations](#known-limitations).  
 A single key is enough: on the Tarsnap side, the delete permission implies the read permission, so a separate read-only key would only be a strict subset.
+
+`TARSNAP_PASSPHRASE`: how Tarsnap obtains the passphrase of a protected key. It requires Tarsnap 1.0.40 or later. It is passed on as `--passphrase` to the creation, the listing and the purge, and appears in the commands printed by `--orphans` and `--dry-run`. Leave it empty for the default behaviour, a prompt on the terminal, which `cron` does not have.
+
+| Value | The passphrase is read from |
+|---|---|
+| empty, or `dev:tty-stdin` | `/dev/tty`, otherwise standard input |
+| `dev:tty-once` | `/dev/tty` only |
+| `dev:stdin-once` | standard input only |
+| `env:NAME` | the environment variable `NAME` |
+| `file:PATH` | the file `PATH`, a single line |
+
+Only `env:` and `file:` work without a terminal, hence under `cron`.  
+Keep the file in mode 0600. For `env:`, pick a variable name of your own rather than one of the script's variables, and make sure the environment of `cron` provides it.  
+On the command line, this setting takes precedence over a `passphrase` line of `tarsnap.conf`, which Tarsnap then silently ignores. Whitespace is not allowed.
+
+Before `prebackup`, the script refuses whitespace in `TARSNAP_KEY` or `TARSNAP_PASSPHRASE`, an unknown method and an invalid variable name. Then, for a protected key, it checks that the passphrase can actually be obtained:
+
+- default and `dev:tty-stdin`: `/dev/tty` can be opened, or standard input is a terminal;
+- `dev:tty-once`: `/dev/tty` can be opened;
+- `dev:stdin-once`: standard input is a terminal;
+- `env:`: the variable is set and not empty;
+- `file:`: the file is readable and holds a single non-empty line. A file that is not a regular one, such as a named pipe, is only checked for readability, so as not to consume it.
+
+Nothing is checked for a key known to be plain: Tarsnap only reads the passphrase to decrypt a key.  
+When the check fails, the run stops with `ERROR: passphrase-protected key, <reason>: <key>`, followed by `(from tarsnap.conf)` when the key comes from there. In `--verbose` mode, the script reports the key read from `tarsnap.conf`, and for a protected key, how its passphrase will be obtained.
 
 The `cachedir`, on the other hand, is not passed on the command line. It is read from `tarsnap.conf`.
 
@@ -409,12 +434,14 @@ Archives beyond the reach of the rotation, hostname "foo".
   Delete command, review before pasting:
   /usr/bin/tarsnap --keyfile /root/tarsnap.key -d -f foo-2026-01-10_03-00-00_before-prod -f old-manual-backup -f bar-2024-02-01_02-00-00
 
---- Partials: interrupted run, checkpoint recovered ---
+--- Partials: truncated, or checkpoint recovered ---
   foo-2026-10-20_00-02-01.part
 
   Delete command, review before pasting:
   /usr/bin/tarsnap --keyfile /root/tarsnap.key -d -f foo-2026-10-20_00-02-01.part
 ```
+
+With `TARSNAP_PASSPHRASE` set, these commands carry the same `--passphrase` option.
 
 ## Checking your retention configuration
 
@@ -489,12 +516,13 @@ The options:
 
 The repository also includes the `tarsnap-diff.sh` script, which compares a Tarsnap snapshot with the current state of the machine and tells you what has changed since.
 
-It sticks to the scope actually backed up: `BACKUP_DIRS`, `BACKUP_EXCLUDE` and `TARSNAP_KEY` are read from `tarsnap-backup.sh`, with the same search order as `rotation-check.sh` and the same precaution: the file is never sourced.
+It sticks to the scope actually backed up: `BACKUP_DIRS`, `BACKUP_EXCLUDE`, `TARSNAP_KEY` and `TARSNAP_PASSPHRASE` are read from `tarsnap-backup.sh`, with the same search order as `rotation-check.sh` and the same precaution: the file is never sourced.  
+The two scripts go together: a `tarsnap-backup.sh` from before `TARSNAP_PASSPHRASE` makes `tarsnap-diff.sh` stop with `variable TARSNAP_PASSPHRASE not found`.
 
 Its own configuration block, at the top of the file, only holds the binary paths, `LOG_DIR` and the installed path of `tarsnap-backup.sh`.
 
 No archive is touched.  
-Only `-tv` and `-x` are used, both read-only on the Tarsnap side: *"Extracting or listing archives may be performed in parallel with any other operation"*.  
+Only `-tv` and `-x` are used, both read-only on the Tarsnap side: *"Extracting or listing archives may be performed in parallel with any other operation"*. With `TARSNAP_KEY` empty, a local `tarsnap --dump-config` comes first, to find the key.  
 The script therefore takes no lock, and you can call it while a backup is running.
 
 ### The four categories
@@ -618,6 +646,9 @@ The operation is atomic, the log is never left truncated, but it changes the ino
 Do not put the log in a directory covered by `BACKUP_DIRS`: it would show up in its own diff as a new file.  
 The script warns you if you give it an absolute path that falls inside one.
 
+The log is created in mode 0600, under a random name next to its final path, then renamed onto it, and so is the working file of the header: a symbolic link planted beforehand under the name of the log, in `/tmp` for instance, is replaced rather than followed.  
+`-l` must name a file: a directory is refused with `log path is a directory`.
+
 ### Progress display
 
 When standard error is a terminal, a progress line counts the entries received while the archive is listed, then a spinner turns if files have to be downloaded.  
@@ -674,7 +705,9 @@ Devices, sockets and named pipes are ignored, and have no business being in `BAC
 
 **The comparison is about content, not metadata:** a file whose permissions or owner alone have changed comes out as `=`.
 
-**Passphrase-protected key:** tarsnap asks for the passphrase on the terminal, once for the listing and once more if files have to be downloaded. The script recognises such a key from its format, and then runs the download without the progress spinner, leaving the messages of tarsnap on the terminal, where the prompt stays visible. If `TARSNAP_KEY` is empty, the key designated by `tarsnap.conf` is out of its sight, and it plays it safe in the same way.
+**Passphrase-protected key:** the script takes `TARSNAP_PASSPHRASE` from `tarsnap-backup.sh`, passes it to the listing and to the download, and applies the same checks before opening the log: a passphrase that cannot be obtained stops it at once, and the previous log of the same snapshot is kept.  
+With `env:` or `file:`, nothing is asked. With the default method or a `dev:` one, Tarsnap asks on the terminal, once for the listing and once more if files have to be downloaded: the download then runs without the progress spinner, leaving the messages of Tarsnap on the terminal, where the prompt stays visible.  
+If `TARSNAP_KEY` is empty, the key of `tarsnap.conf` is read through `tarsnap --dump-config`, as in `tarsnap-backup.sh`. When it stays unknown, the script plays it safe in the same way, unless the method is `env:` or `file:`.
 
 ## Statistics and storage cost
 
@@ -733,13 +766,15 @@ Elsewhere, it will refuse to start until the configuration block and the package
 **Tarsnap exit code 2 is not singled out:** Tarsnap uses it to report an error that occurred after the server-side state had already been modified.  
 `set -e` treats it like any other error.
 
-**Passphrase-protected key:** Tarsnap reads the key again on every invocation, and therefore asks for the passphrase again, up to three times per run: creation, listing, purge.  
-Without a terminal, under `cron` for example, the script stops before `prebackup`, with an explicit message. A standard input that is not a terminal counts as no terminal: piping the passphrase in is not supported, since every invocation would read it again. To run the script through `ssh host command`, add `-t`.
+**Passphrase-protected key:** Tarsnap reads the key again on every invocation, and therefore needs the passphrase again, up to three times per run: creation, listing, purge.  
+With the default method or a `dev:` one, without the terminal that the method needs, under `cron` for example, the script stops before `prebackup`, with an explicit message: use `env:` or `file:` instead, see [Tarsnap](#tarsnap). A standard input that is not a terminal counts as no terminal: piping the passphrase in is not supported, since every invocation would read it again. To run the script through `ssh host command`, add `-t`.
 
-This check only covers the key named in `TARSNAP_KEY`. With `TARSNAP_KEY` empty, the key designated by `tarsnap.conf` is out of the script's sight, and a protected key will only fail once `prebackup` has run.
+**A `passphrase` line in `tarsnap.conf` is not seen:** the script only reads the key there. A `passphrase` line with `env:` or `file:` would be enough for Tarsnap without a terminal, but the script refuses the protected key all the same: set the method in `TARSNAP_PASSPHRASE` instead, which takes precedence over `tarsnap.conf`.
 
-**Passphrase read from a file or a variable:** since version 1.0.40, Tarsnap can read the passphrase from a file or from an environment variable, with `--passphrase`.  
-The script does not use this option, and its terminal check does not know about it: a protected key named in `TARSNAP_KEY` is refused without a terminal all the same.
+**The key of `tarsnap.conf` may stay unknown:** with `TARSNAP_KEY` empty, the script cannot tell which key Tarsnap will use when `tarsnap --dump-config` exits with a non-zero status (Tarsnap older than 1.0.40, invalid configuration), shows no `keyfile` line, or gives a path that starts with `~` or contains a blank. Tarsnap expands `~` from the password database, which the script does not read.  
+Only an `env:` or `file:` method is then checked, and a protected key asked on the terminal will only fail once `prebackup` has run. An unreadable key is treated in the same way, and left to Tarsnap, which names it in its own error message.
+
+**Tarsnap older than 1.0.40:** it knows neither `--passphrase` nor `--dump-config`, and the script does not check the version: with `TARSNAP_PASSPHRASE` set, a backup fails as soon as Tarsnap receives `--passphrase`, at the creation of the archive, after `prebackup` has run.
 
 ## Restoring
 
