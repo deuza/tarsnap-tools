@@ -57,7 +57,22 @@ ORPHANS=0        # 1 = list the archives outside the rotation, then exit
 # --- Tarsnap ---
 # Path of the Tarsnap private key.
 # Leave empty to rely on the keyfile declared in tarsnap.conf.
+# No whitespace allowed.
 TARSNAP_KEY="/root/tarsnap.key"
+
+# Passphrase entry method for a protected key, passed to tarsnap as
+# --passphrase (tarsnap 1.0.40 or later). Leave empty for the default
+# behaviour: tarsnap asks on the terminal, which cron does not have.
+#   dev:tty-stdin   /dev/tty, otherwise stdin (the default of tarsnap)
+#   dev:tty-once    /dev/tty only
+#   dev:stdin-once  stdin only
+#   env:NAME        environment variable NAME, which cron must provide;
+#                   pick a name of your own, not a variable of this script
+#   file:PATH       a single line, the passphrase; keep the file in 0600
+# Only env: and file: work without a terminal. On the command line, the
+# method takes precedence over a "passphrase" line of tarsnap.conf, which
+# tarsnap then silently ignores. No whitespace allowed.
+TARSNAP_PASSPHRASE=""
 
 # Directories to back up (space-separated)
 BACKUP_DIRS="/root /boot /var/www /etc"
@@ -231,9 +246,11 @@ orphans_section() {
 # Snapshots created with -s, archives made by hand, archives from another
 # machine sharing the same key, archives dating from a previous hostname.
 #
-# The partials: suffixed .part, leftovers of an interrupted run from which
-# tarsnap recovered a checkpoint. They count for deduplication and may
-# contain data found nowhere else.
+# The partials: suffixed .part, leftovers of an interrupted run. tarsnap(1)
+# gives two origins: an archive truncated on purpose, by ^Q, SIGQUIT or the
+# --maxbw limit, and the last checkpoint of a run that died, which tarsnap
+# recovers at the next creation or deletion. They count for deduplication
+# and may contain data found nowhere else.
 list_orphans() {
     say "Fetching the list of archives."
     # shellcheck disable=SC2086
@@ -254,7 +271,7 @@ list_orphans() {
 
     printf 'Archives beyond the reach of the rotation, hostname "%s".\n\n' "$COMPUTER"
     orphans_section "Orphans: name outside the pattern, never purged" "$_orphans"
-    orphans_section "Partials: interrupted run, checkpoint recovered" "$_parts"
+    orphans_section "Partials: truncated, or checkpoint recovered" "$_parts"
     return 0
 }
 
@@ -296,6 +313,56 @@ key_is_passphrased() {
         scrypt) return 0 ;;
     esac
     return 1
+}
+
+# Can tarsnap obtain the passphrase of a protected key, with the method of
+# TARSNAP_PASSPHRASE? Mirrors tarsnap 1.0.41, method by method: readpass()
+# of libcperciva reads /dev/tty then stdin for dev:tty-stdin (devtty 1),
+# stdin only for dev:stdin-once (devtty 0) and /dev/tty only for
+# dev:tty-once (devtty 2); env: calls getenv(); file: calls
+# readpass_file(), which wants a single line and strips its CR or LF.
+# An empty variable or file is refused as well: tarsnap would read an
+# empty passphrase and fail on it, after prebackup. A file that is not a
+# regular one (FIFO, device) is only checked for readability, so as not
+# to consume it. Sets PASSPHRASE_HOW for the verbose message and
+# PASSPHRASE_WHY for the error message. TARSNAP_PASSPHRASE has been
+# validated beforehand: the eval only ever sees a valid variable name.
+passphrase_reachable() {
+    case "$TARSNAP_PASSPHRASE" in
+        ""|dev:tty-stdin)
+            PASSPHRASE_HOW="tarsnap will ask for it on each call"
+            PASSPHRASE_WHY="no terminal to type the passphrase"
+            ( exec </dev/tty ) 2>/dev/null || [ -t 0 ]
+            ;;
+        dev:tty-once)
+            PASSPHRASE_HOW="tarsnap will ask for it on /dev/tty on each call"
+            PASSPHRASE_WHY="dev:tty-once and no /dev/tty"
+            ( exec </dev/tty ) 2>/dev/null
+            ;;
+        dev:stdin-once)
+            PASSPHRASE_HOW="tarsnap will ask for it on stdin on each call"
+            PASSPHRASE_WHY="dev:stdin-once and stdin is not a terminal"
+            [ -t 0 ]
+            ;;
+        env:*)
+            _pp_name=${TARSNAP_PASSPHRASE#env:}
+            PASSPHRASE_HOW="read from the environment variable $_pp_name"
+            PASSPHRASE_WHY="environment variable $_pp_name unset or empty"
+            _pp_value=""
+            eval "_pp_value=\${$_pp_name-}"
+            [ -n "$_pp_value" ]
+            ;;
+        file:*)
+            _pp_file=${TARSNAP_PASSPHRASE#file:}
+            PASSPHRASE_HOW="read from $_pp_file"
+            PASSPHRASE_WHY="passphrase file $_pp_file unreadable,"
+            PASSPHRASE_WHY="$PASSPHRASE_WHY empty or not a single line"
+            [ -r "$_pp_file" ] || return 1
+            [ -f "$_pp_file" ] || return 0
+            [ -s "$_pp_file" ] &&
+                [ "$("$SED_BIN" -n '$=' "$_pp_file")" = 1 ]
+            ;;
+    esac
 }
 
 # POSIX getopts only knows single-character options: the long forms are
@@ -351,20 +418,53 @@ case "$SNAPSHOT_NAME" in
         die "invalid snapshot name, allowed characters: A-Z a-z 0-9 _ -" ;;
 esac
 
+# TARSNAP_KEY and TARSNAP_PASSPHRASE end up in TARSNAP_KEYOPT, expanded
+# unquoted so that the options vanish when empty (see below): a blank
+# would split a value into two arguments. Refused here, rather than
+# quoting every tarsnap call.
+case "$TARSNAP_KEY" in
+    *[[:space:]]*)
+        die "TARSNAP_KEY must not contain whitespace: $TARSNAP_KEY" ;;
+esac
+case "$TARSNAP_PASSPHRASE" in
+    *[[:space:]]*)
+        die "TARSNAP_PASSPHRASE must not contain whitespace:" \
+            "$TARSNAP_PASSPHRASE" ;;
+esac
+
+# The passphrase method must be one that tarsnap understands, otherwise it
+# would stop on "Cannot parse passphrase entry method", after prebackup.
+# The name of an env: variable is checked once and for all, since
+# passphrase_reachable() hands it to eval: an explicit list rather than a
+# range such as [A-Za-z], whose content depends on the locale.
+case "$TARSNAP_PASSPHRASE" in
+    ""|dev:tty-stdin|dev:tty-once|dev:stdin-once|env:[!0-9]*|file:?*) ;;
+    *)
+        die "invalid TARSNAP_PASSPHRASE, see the configuration block:" \
+            "$TARSNAP_PASSPHRASE" ;;
+esac
+case "$TARSNAP_PASSPHRASE" in
+    env:*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_]*)
+        die "invalid variable name in TARSNAP_PASSPHRASE:" \
+            "$TARSNAP_PASSPHRASE" ;;
+esac
+
 # The key must be readable, unless tarsnap.conf is relied upon.
 if [ -n "$TARSNAP_KEY" ] && [ ! -r "$TARSNAP_KEY" ]; then
     die "tarsnap key not readable: $TARSNAP_KEY"
 fi
 
 # Passphrase-protected key. tarsnap reads the key again on each invocation,
-# hence asks for the passphrase again, up to three times per run: creation,
-# listing, purge. It asks through readpass() from libcperciva, which reads
-# /dev/tty if it can open it, otherwise stdin, and only prompts on stderr
-# when its source is a terminal. Without a terminal, as under cron, tarsnap
-# fails on "EOF reading password", but only after prebackup, and therefore
-# the dumps, have run. Hence this check, made here and in every mode, since
-# all of them read the key (normal, --dry-run, -s and --orphans), rather
-# than in prebackup, which is a user hook.
+# hence needs the passphrase again, up to three times per run: creation,
+# listing, purge. By default, it asks through readpass() from libcperciva,
+# which reads /dev/tty if it can open it, otherwise stdin, and only prompts
+# on stderr when its source is a terminal. Without a terminal, as under
+# cron, tarsnap fails on "EOF reading password", but only after prebackup,
+# and therefore the dumps, have run. Hence this check, made here and in
+# every mode, since all of them read the key (normal, --dry-run, -s and
+# --orphans), rather than in prebackup, which is a user hook. A method set
+# in TARSNAP_PASSPHRASE changes the condition, see passphrase_reachable():
+# env: and file: need no terminal at all.
 #
 # "A terminal is available" is tested as close as possible to readpass():
 #   - /dev/tty is really opened. [ -r /dev/tty ] would not do: the node is
@@ -379,17 +479,30 @@ fi
 # prebackup, would read that same stdin.
 #
 # With TARSNAP_KEY empty, the key designated by tarsnap.conf is out of
-# sight: nothing is tested, and a protected key still fails later, after
-# prebackup. tarsnap-diff.sh then assumes that the key may prompt, which
-# only costs it some display; here, the same assumption would block every
-# cron job whose plain key is declared in tarsnap.conf.
+# sight: only an env: or file: method is checked, below, and a protected
+# key asked on the terminal still fails later, after prebackup.
+# tarsnap-diff.sh then assumes that the key may prompt, which only costs it
+# some display; here, the same assumption would block every cron job whose
+# plain key is declared in tarsnap.conf.
 if [ -n "$TARSNAP_KEY" ] && key_is_passphrased "$TARSNAP_KEY"; then
-    if ( exec </dev/tty ) 2>/dev/null || [ -t 0 ]; then
-        say "Passphrase-protected key: tarsnap will ask for it on each call."
+    if passphrase_reachable; then
+        say "Passphrase-protected key: $PASSPHRASE_HOW."
     else
-        die "passphrase-protected key, no terminal to type the passphrase:" \
+        die "passphrase-protected key, $PASSPHRASE_WHY:" \
             "$TARSNAP_KEY"
     fi
+fi
+
+# An env: or file: method with the key of tarsnap.conf: it was set for a
+# protected key, so it is checked as well, rather than failing after
+# prebackup. With a plain key known to the script, nothing is checked:
+# tarsnap only reads the passphrase to decrypt a key.
+if [ -z "$TARSNAP_KEY" ]; then
+    case "$TARSNAP_PASSPHRASE" in
+        env:*|file:*)
+            passphrase_reachable ||
+                die "$PASSPHRASE_WHY (key from tarsnap.conf)" ;;
+    esac
 fi
 
 # Locale: we want predictable output from tarsnap, apt and date.
@@ -408,6 +521,14 @@ if [ -n "$TARSNAP_KEY" ]; then
     TARSNAP_KEYOPT="--keyfile $TARSNAP_KEY"
 else
     TARSNAP_KEYOPT=""
+fi
+
+# The passphrase method rides along with the key: TARSNAP_KEYOPT already
+# reaches every tarsnap call, including the commands printed by --orphans
+# and --dry-run.
+if [ -n "$TARSNAP_PASSPHRASE" ]; then
+    TARSNAP_KEYOPT="${TARSNAP_KEYOPT:+$TARSNAP_KEYOPT }--passphrase"
+    TARSNAP_KEYOPT="$TARSNAP_KEYOPT $TARSNAP_PASSPHRASE"
 fi
 
 if [ "$VERBOSE" -eq 1 ]; then
@@ -570,8 +691,10 @@ for archive in $ARCHIVES; do
     # the script.
     case "$archive" in
         *.part)
-            # Interrupted archive (power failure, network, ^Q) from which a
-            # checkpoint was recovered. It counts for deduplication and may
+            # Partial archive, left by an interrupted run: truncated on
+            # purpose (^Q, SIGQUIT, --maxbw), or the last checkpoint of a run
+            # that died (power failure, network), recovered by the next -c
+            # or -d. It counts for deduplication and may
             # be of value: it is not deleted, a warning is issued instead.
             # The message goes to stderr, hence into the cron mail.
             printf 'WARNING: partial archive: %s\n' "$archive" >&2
