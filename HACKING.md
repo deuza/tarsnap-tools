@@ -13,6 +13,7 @@ Using the suite only requires the [README](README.md).
 - [ShellCheck directives](#shellcheck-directives)
 - [Technical choices](#technical-choices)
 - [Passphrase and key detection](#passphrase-and-key-detection)
+- [Exclusion matching in Tarsnap](#exclusion-matching-in-tarsnap)
 - [The `--dry-run-metadata` bug](#the---dry-run-metadata-bug)
 
 ## Repository layout
@@ -112,7 +113,7 @@ Each directive sits right above the command it covers, with its reason in a comm
 
 Within a hook, `set -e` only stops the script on a command that fails on a line of its own: not in a pipeline, except in its last command, `dash` having no `pipefail`, nor on the left of `&&` or `||`, nor in the condition of an `if` or a `while`. One command per line, and test what has to be tested (N-R2-11).
 
-**`--quiet --no-print-stats`.** Without `--verbose`, the script passes these two options to Tarsnap. `--quiet` silences a few warnings such as "Removing leading '/'", and `--no-print-stats` overrides a `print-stats` directive in `tarsnap.conf`, which would otherwise print the statistics table on every run. The script only speaks up on errors.
+**`--quiet --no-print-stats --no-totals --no-progress-bytes`.** Without `--verbose`, the script passes these four options to Tarsnap. `--quiet` silences a few warnings such as "Removing leading '/'", among them "Archive contains no files" (`tar/write.c:464-466`), hence the refusal by `check_excludes()` of a pattern that would match everything. The three others override the `print-stats`, `totals` and `progress-bytes` directives of `tarsnap.conf`, which would otherwise write the statistics block, the total of bytes written or progress lines to standard error, hence a `cron` mail every night (N-GAP2-1). `--no-progress-bytes` requires Tarsnap 1.0.40 or later. The script only speaks up on errors.
 
 **`printf`, not `echo`.** The behaviour of `echo` on a backslash or on an argument starting with `-` is not specified by POSIX: `dash` interprets escape sequences where `bash` does not. `printf` raises no such issue.
 
@@ -122,11 +123,15 @@ Within a hook, `set -e` only stops the script on a command that fails on a line 
 
 **`en_US.UTF-8` locale forced.** Tarsnap, `apt` and `date` then produce predictable output. `LANGUAGE` is unset, since GNU gettext would otherwise override `LC_MESSAGES`.
 
+**Explicit character lists, never ranges.** The content of a range such as `[0-9]` or `[A-Za-z]` depends on the locale, and under `bash`, `[0-9]` also matches digits other than 0 to 9 (N-R2-9). The strict stamp of the archive names, `STAMP_GLOB`, therefore spells out `[0123456789]`, and `is_safe_name()` and the check of an `env:` variable name give their letters in full. `shown()` keeps a range, `[^ -~]`, but under `LC_ALL=C`, where it is a range of bytes: every byte outside printable ASCII becomes `?`, so that an archive name holding ESC or CR can neither drive the terminal nor garble the `cron` mail (N-R2-4). The delete commands printed by `--orphans` only take the names that `is_safe_name()` accepts: the others stay listed above them, and are counted apart (TB-03).
+
+**The archive list read line by line, its dates checked.** The output of `--list-archives` is read with `while IFS= read -r`, never split on blanks, so that a name holding a space stays one name (N-R1-11). The dates are computed from noon of the archive day, its midnight taken as noon minus 12 hours: in the time zones where the change to summer time skips midnight, `date -d "$day"` would fail and stop the purge (N-R1-13). A name of the strict form whose date does not exist, 30 February for instance, is kept with a warning instead of stopping the run (TB-04).
+
 **Why a batch purge is faster.** A single `tarsnap -d` invocation opens one storage reader for all the deletions, with a block cache: what a deletion has already fetched can be served from that cache to the next ones instead of being downloaded again. See `tarsnap_mode_d()` in `tar/glue/tape.c` and `deletetape()` in `tar/multitape/multitape_delete.c`. Tarsnap 1.0.33 already announced a significant speedup of multi-archive deletes.
 
 **`tarsnap-diff.sh`: a single extraction.** The files to compare byte by byte are gathered first, then extracted in one Tarsnap invocation through `-T`, which reads the list of names from a file. One invocation per file would reopen the archive on the server side every time, which becomes ruinous from a hundred files onwards.
 
-**`tarsnap-diff.sh`: dates compared as strings.** `tarsnap -tv --iso-dates` and `find -printf '%TY-%Tm-%Td %TH:%TM:%TS'` both give the local time as `YYYY-MM-DD HH:MM:SS`, once the fractional seconds printed by `find` are truncated. Comparing the strings gives the same verdict as comparing epochs, without forking one `date` per entry: over the 50,000 entries of a real machine, that took several minutes of pure forking.
+**`tarsnap-diff.sh`: dates compared as strings.** `tarsnap -tv --iso-dates` and `find -printf '%TY-%Tm-%Td %TH:%TM:%TS'` both give the local time as `YYYY-MM-DD HH:MM:SS`, once the fractional seconds printed by `find` are truncated. Comparing the strings avoids forking one `date` per entry: over the 50,000 entries of a real machine, that took several minutes of pure forking. It gives the same verdict as comparing epochs, except in the hour repeated when the clocks go back, where t and t + 3600 s print the same: a file of the same size rewritten exactly one hour later then comes out as `=`, without being downloaded (N-R2-13). Setting `TZ=UTC0` on both sources would remove the case, and is left to the series of `tarsnap-diff.sh`. A rewrite of the same size within the same second stays invisible in any case, both sides counting in seconds (N-R2-12).
 
 **`tarsnap-diff.sh`: `LC_ALL=C` on `sort` and `join`.** `join` silently misbehaves when the collation order of its inputs is not its own. `sort -u` on the key also guards against a path present twice, which would otherwise produce the Cartesian product of the duplicates.
 
@@ -147,10 +152,10 @@ Three functions exist in `tarsnap-backup.sh` and in `tarsnap-diff.sh`, and must 
 | empty, `dev:tty-stdin` | `/dev/tty`, then standard input, through `readpass()` | `/dev/tty` opens, or standard input is a terminal |
 | `dev:tty-once` | `/dev/tty` only | `/dev/tty` opens |
 | `dev:stdin-once` | standard input only | standard input is a terminal |
-| `env:NAME` | the variable, through `getenv()` | the variable is set and not empty |
-| `file:PATH` | a single line, CR or LF stripped, through `readpass_file()` | the file is readable and holds a single non-empty line |
+| `env:NAME` | the variable, through `getenv()` | the variable is set and not empty, tested through `${NAME:+x}`: the value enters neither a shell variable nor the `set -x` trace of `--debug` |
+| `file:PATH` | a single line, ending at its first CR or LF, through `readpass_file()` | the file is readable and holds a single line, neither empty nor starting with a CR; `sed` only answers the verdict, so the passphrase never reaches the shell |
 
-`/dev/tty` is really opened, rather than tested with `[ -r ]`. An empty variable or file is refused as well: Tarsnap would read an empty passphrase and fail on it, later. A file that is not a regular one, a FIFO or a device, is only checked for readability, so as not to consume it. The function sets `PASSPHRASE_HOW` for the verbose message and `PASSPHRASE_WHY` for the error message. Its `eval` only ever sees a variable name validated beforehand, against an explicit list of characters rather than a range such as `[A-Za-z]`, whose content depends on the locale.
+`/dev/tty` is really opened, rather than tested with `[ -r ]`. An empty variable or file is refused as well: Tarsnap would read an empty passphrase and fail on it, later (TB-11, TD-01). The messages about an invalid `TARSNAP_PASSPHRASE` never print its value (N-R1-14). A file that is not a regular one, a FIFO or a device, is only checked for readability, so as not to consume it. The function sets `PASSPHRASE_HOW` for the verbose message and `PASSPHRASE_WHY` for the error message. Its `eval` only ever sees a variable name validated beforehand, against an explicit list of characters rather than a range such as `[A-Za-z]`, whose content depends on the locale.
 
 **`conf_keyfile()`** asks Tarsnap which key `tarsnap.conf` designates, when `TARSNAP_KEY` is empty. `--dump-config` alone switches Tarsnap to its `--verify-config` mode, which exits before loading the key (`tar/bsdtar.c`, 1.0.41): no passphrase prompt and no network access. The function relies on this output:
 
@@ -160,6 +165,25 @@ Three functions exist in `tarsnap-backup.sh` and in `tarsnap-diff.sh`, and must 
 - the first value wins, hence the first `  keyfile` line after the first header.
 
 The key stays unknown when this answer is not reliable: a non-zero exit (Tarsnap older than 1.0.40, invalid configuration), no `keyfile` line, an argument starting with `~`, which Tarsnap expands from the password database and not from `$HOME`, or an argument containing a blank, which Tarsnap keeps with a warning. Both scripts then only check an `env:` or `file:` method.
+
+## Exclusion matching in Tarsnap
+
+`tarsnap -c` matches the exclusion patterns against the path of each entry as found on disk, leading `/` included: `write_hierarchy()` takes the `tree_current_path()` of the entry (`tar/write.c:779`) and tests it with `excluded()` (`tar/write.c:808`), before `edit_pathname()` strips that `/` from the name stored in the archive (`tar/write.c:988`).
+
+`match_exclusion()` (`tar/matching.c:204-213`) then applies two rules:
+
+- a pattern starting with `/` or `*` is matched against the whole path, hence anchored at the root when it starts with `/`;
+- any other pattern is tried after each `/` of the path, hence at every component.
+
+The comparison goes through `pathmatch()` (`tar/matching.c:308-327`), which strips a leading `./` from the pattern and from the path, then through `fnmatch()` with `FNM_LEADING_DIR` (`tar/matching.c:337`), so that a pattern matching a directory also matches everything below it. That branch is the one taken with glibc, `configure` checking the flag with `_GNU_SOURCE` defined (`configure.ac:357-364`); without it, a built-in copy of `fnmatch()` always behaves as if `FNM_LEADING_DIR` were set.
+
+Consequences for the scripts:
+
+- `tarsnap-backup.sh` passes an absolute pattern as is, hence anchored at the root, and adds `pattern/*` for its contents, which only repeats what `FNM_LEADING_DIR` already does and stays as a safety. Without its leading `/`, the pattern would be tried at every level, and would also exclude every directory of the same name further down (TB-07).
+- `check_excludes()`, shared by `tarsnap-backup.sh` and `tarsnap-diff.sh`, removes the trailing slashes, which `tarsnap-diff.sh` would otherwise compare as written, and refuses `/` alone, which would exclude every entry of `BACKUP_DIRS` without a message (N-R2-5).
+- `is_excluded()` in `tarsnap-diff.sh` reproduces `match_exclusion()` on `/` followed by the stored path: a pattern starting with `/` or `*` is matched from the root, any other after some `/`, each one on the path itself and on everything below it (TD-02).
+
+These line numbers refer to the `1.0.41` tag of the Tarsnap repository.
 
 ## The `--dry-run-metadata` bug
 
@@ -174,7 +198,7 @@ Reproduced in 1.0.41 on each of the four directories of `BACKUP_DIRS` taken indi
 
 `print-stats` has nothing to do with it either: the failure also occurs with `--no-print-stats`. Note, however, that a single file passed as an argument is not always enough to trigger the error, even if it is in the cache: the cache has to be able to provide a complete archive entry.
 
-The cause can be seen in the 1.0.41 source. `multitape_write.c:429` sets `no_chunkifiers = (dryrun == 2)`, which deprives the streams initialised on lines 517 to 521 of a chunkifier, whereas the chunk layer `d->C` is created on line 503 with no condition on `dryrun`. As a result, `writetape_ischunkpresent` answers "present" where `writetape_writechunk` returns 0, and `ccache_entry.c:409` treats that 0 as a programmer error. These line numbers refer to the `1.0.41` tag of the Tarsnap repository.
+The cause can be seen in the 1.0.41 source. `multitape_write.c:429` sets `no_chunkifiers = (dryrun == 2)`, which deprives the streams initialised on lines 517 to 521 of a chunkifier, whereas the chunk layer `d->C` is created on line 503 with no condition on `dryrun`. As a result, `writetape_ischunkpresent` answers "present" where `writetape_writechunk` returns 0, and `ccache_entry.c:407-409` treats that 0 as a programmer error. These line numbers refer to the `1.0.41` tag of the Tarsnap repository.
 
 Do not put the option back without checking that this has been fixed upstream. The command that reproduces it, read-only and on a copy of the cache:
 

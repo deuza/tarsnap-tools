@@ -1030,7 +1030,8 @@ if [ "$DRY" -eq 1 ]; then
     # on lines 517 to 521 of a chunkifier, whereas the chunk layer d->C is
     # created on line 503 with no condition on dryrun. As a result,
     # writetape_ischunkpresent answers "present" where writetape_writechunk
-    # returns 0, and ccache_entry.c:409 treats that 0 as a programmer error.
+    # returns 0, and ccache_entry.c:407-409 treats that 0 as a programmer
+    # error.
     #
     # Do not put the option back without checking that this has been fixed
     # upstream.
