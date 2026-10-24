@@ -278,10 +278,11 @@ list_orphans() {
     _orphans=""
     _parts=""
     for _a in $_all; do
+        # shellcheck disable=SC2254
         case "$_a" in
             *.part)
                 _parts="${_parts} ${_a}" ;;
-            "${COMPUTER}-"[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+            "${COMPUTER}-"$STAMP_GLOB)
                 ;;
             *)
                 _orphans="${_orphans} ${_a}" ;;
@@ -726,6 +727,16 @@ fi
 
 COMPUTER=$("$UNAME_BIN" -n)
 
+# Strict stamp of the archive names, YYYY-MM-DD_HH-MM-SS. The digits are
+# written in full rather than as the range [0-9]: the content of a range
+# depends on the locale, and under bash [0-9] also matches digits other
+# than 0 to 9. The expansion is left unquoted where it is used, so that it
+# acts as a pattern and not as a literal string.
+_digit='[0123456789]'
+STAMP_GLOB="${_digit}${_digit}${_digit}${_digit}-${_digit}${_digit}"
+STAMP_GLOB="${STAMP_GLOB}-${_digit}${_digit}_${_digit}${_digit}"
+STAMP_GLOB="${STAMP_GLOB}-${_digit}${_digit}-${_digit}${_digit}"
+
 # --orphans mode: read-only, hence no lock. The tarsnap man page only
 # requires it for two concurrent create or delete operations, not for
 # --list-archives: the archives can therefore be queried while a backup
@@ -855,7 +866,23 @@ NOW_UNIX=$("$DATE_BIN" +%s)
 # one, and the father tier never keeps anything.
 DAILY_SEC=$((DAILY * 86400))
 WEEKLY_SEC=$((DAILY_SEC + WEEKLY * 604800))
-MONTHLY_UNIX=$(($("$DATE_BIN" -d "-${MONTHLY} months" +%s) - WEEKLY_SEC))
+#
+# The monthly bound is MONTHLY months before today, on the same day of the
+# month, brought back to the last day of that month when it is shorter.
+# "date -d -N months" would instead spill over into the following month
+# (31 August minus 6 months gives 3 March): the bound would then move back
+# at the end of some months, and an archive could be kept, deleted, then
+# kept again. Noon, for the days without midnight.
+MONTHLY_DAY=$("$DATE_BIN" +%-d)
+MONTHLY_YM=$("$DATE_BIN" +%Y-%m-15)
+MONTHLY_YM=$("$DATE_BIN" -d "$MONTHLY_YM 12:00 ${MONTHLY} months ago" +%Y-%m)
+MONTHLY_LAST=$("$DATE_BIN" -d "${MONTHLY_YM}-15 12:00 1 month" +%Y-%m-01)
+MONTHLY_LAST=$("$DATE_BIN" -d "$MONTHLY_LAST 12:00 1 day ago" +%-d)
+if [ "$MONTHLY_DAY" -gt "$MONTHLY_LAST" ]; then
+    MONTHLY_DAY=$MONTHLY_LAST
+fi
+MONTHLY_UNIX=$("$DATE_BIN" -d "${MONTHLY_YM}-${MONTHLY_DAY} 12:00" +%s)
+MONTHLY_UNIX=$((MONTHLY_UNIX - WEEKLY_SEC))
 
 say "Fetching the list of archives."
 # shellcheck disable=SC2086
@@ -879,7 +906,15 @@ SEEN_WEEKS=" "
 SEEN_MONTHS=" "
 
 # The naming pattern forbids spaces, so splitting on IFS is safe.
-for archive in $ARCHIVES; do
+# One archive per line, read whole: a name containing a space or a tab is
+# then one name, and not several words of which one could take the strict
+# form and be passed to tarsnap -d. The list is fed by a here-document and
+# not by a pipe, so that the loop runs in the current shell and the -f
+# options it accumulates in "$@" survive it.
+while IFS= read -r archive; do
+    # Empty line: the account holds no archive at all.
+    [ -n "$archive" ] || continue
+
 
     # The archive this very run created is never purged by its own run,
     # whatever the clock says. Its name is fixed before the creation and
@@ -899,6 +934,7 @@ for archive in $ARCHIVES; do
     # "hostname-YYYY-MM-DD_HH-MM-SS".
     # Everything else (snapshots created by hand) is beyond the reach of
     # the script.
+    # shellcheck disable=SC2254
     case "$archive" in
         *.part)
             # Partial archive, left by an interrupted run: truncated on
@@ -911,7 +947,7 @@ for archive in $ARCHIVES; do
             printf '  leftover of an interrupted run, to be handled by hand\n' >&2
             continue
             ;;
-        "${COMPUTER}-"[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+        "${COMPUTER}-"$STAMP_GLOB)
             ;;
         *)
             say "Outside the pattern, untouchable: $archive"
@@ -923,9 +959,23 @@ for archive in $ARCHIVES; do
     stamp=${archive#"${COMPUTER}-"}
     day=${stamp%%_*}
 
-    f_unix=$("$DATE_BIN" -d "$day" +%s)
-    f_dow=$("$DATE_BIN" -d "$day" +%w)
-    f_dom=$("$DATE_BIN" -d "$day" +%-d)   # %-d: no leading zero, no octal
+    # The dates are computed from noon of the day, and its midnight is
+    # taken as noon minus 12 hours: in some time zones a change to summer
+    # time skips midnight itself (America/Havana, 8 March 2026), and
+    # date -d "$day" then fails. On every other day, noon minus 12 hours is
+    # that midnight.
+    #
+    # A name of the strict form whose date does not exist (30 February) is
+    # kept with a warning, rather than stopping the rotation every night.
+    if ! f_noon=$("$DATE_BIN" -d "$day 12:00" +%s 2>/dev/null); then
+        printf 'WARNING: archive with an impossible date, kept: %s\n' \
+            "$archive" >&2
+        continue
+    fi
+    f_unix=$((f_noon - 43200))
+    f_dow=$("$DATE_BIN" -d "$day 12:00" +%w)
+    # %-d: no leading zero, hence no octal.
+    f_dom=$("$DATE_BIN" -d "$day 12:00" +%-d)
 
     age=$((NOW_UNIX - f_unix))
 
@@ -947,10 +997,14 @@ for archive in $ARCHIVES; do
     m_day=""
     m_unix=0
     if [ "$f_unix" -gt "$MONTHLY_UNIX" ]; then
-        m_key=$("$DATE_BIN" -d "$day -$((DOM - 1)) days" +%Y-%m)
-        m_ref=$("$DATE_BIN" -d "${m_key}-01 +$((DOM - 1)) days" '+%F %s')
+        # Noon again, for the days without midnight. The relative item
+        # comes first: placed after a time, "-N" would be read as a time
+        # zone offset.
+        m_key=$("$DATE_BIN" -d "-$((DOM - 1)) days $day 12:00" +%Y-%m)
+        m_ref="+$((DOM - 1)) days ${m_key}-01 12:00"
+        m_ref=$("$DATE_BIN" -d "$m_ref" '+%F %s')
         m_day=${m_ref% *}
-        m_unix=${m_ref#* }
+        m_unix=$((${m_ref#* } - 43200))
     fi
 
     # Father: the first archive of each week, a week starting on day DOW,
@@ -964,9 +1018,9 @@ for archive in $ARCHIVES; do
     # its month, so that the month does not get a second one below.
     if [ "$age" -lt "$WEEKLY_SEC" ]; then
         w_back=$(( (f_dow - DOW + 7) % 7 ))
-        w_ref=$("$DATE_BIN" -d "$day -$w_back days" '+%F %s')
+        w_ref=$("$DATE_BIN" -d "-$w_back days $day 12:00" '+%F %s')
         w_key=${w_ref% *}
-        w_unix=${w_ref#* }
+        w_unix=$((${w_ref#* } - 43200))
         if [ $((NOW_UNIX - w_unix)) -lt "$WEEKLY_SEC" ]; then
             case "$SEEN_WEEKS" in
                 *" $w_key "*) ;;
@@ -1000,7 +1054,9 @@ for archive in $ARCHIVES; do
     fi
 
     set -- "$@" -f "$archive"
-done
+done <<_END_OF_ARCHIVE_LIST_
+$ARCHIVES
+_END_OF_ARCHIVE_LIST_
 
 # Two parameters per archive (-f and the name).
 COUNT=$(($# / 2))
