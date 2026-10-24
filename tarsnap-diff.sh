@@ -70,9 +70,11 @@
 #   Equal sizes, equal mtime
 #       "identical". This is a heuristic, acknowledged as such: a file
 #       rewritten with exactly the same size, whose mtime was then reset to
-#       its original value, would slip through. It has to be done on
-#       purpose. Strict mode is there for those who are not satisfied with
-#       that.
+#       its original value, would slip through. So would, without anyone
+#       meaning it, a file rewritten with the same size within the second
+#       of the modification that the snapshot saw: the listing gives the
+#       date to the second (N-R2-12). Strict mode is there for those who
+#       are not satisfied with that.
 #
 #   Equal sizes, different mtime
 #       Ambiguous, and the only case that justifies an actual read. The
@@ -981,6 +983,8 @@ TARSNAP_ERR="$TMP_DIR/tarsnap.err"
 ARCHIVE_FILES="$TMP_DIR/archive.files"
 HARD_RAW="$TMP_DIR/hard.raw"
 HARD_LIST="$TMP_DIR/hardlinks"
+HARD_BY_NAME="$TMP_DIR/hardlinks.byname"
+PATTERNS="$TMP_DIR/patterns"
 
 TAB=$(printf '\t')
 SOH=$(printf '\001')
@@ -1436,8 +1440,18 @@ say "$del_count deleted, $new_count new."
 
 say "Classifying the common files."
 {
-    while IFS="$TAB" read -r path type_a size_a stamp_a _type_l size_l stamp_l; do
+    while IFS="$TAB" read -r path type_a size_a stamp_a type_l size_l stamp_l; do
         [ -n "$path" ] || continue
+
+        # The same name with another type on each side, a file that became
+        # a directory or a symbolic link for instance: modified, at once.
+        # Neither the sizes nor cmp, which follows links, would mean
+        # anything here (TD-03).
+        if [ "$type_a" != "$type_l" ]; then
+            mod_count=$((mod_count + 1))
+            [ "$SHOW_MODIFIED" -eq 1 ] && log "* ${path}"
+            continue
+        fi
 
         # Directories and links: their mere presence on both sides counts
         # as identical, see the limitations at the top of the script.
@@ -1491,8 +1505,24 @@ fi
 # STEP 5c: BYTE-BY-BYTE CHECK OF THE AMBIGUOUS CASES
 ###############################################################################
 
+EXTRACT_FAILED=0
 if [ "$cand_count" -gt 0 ]; then
     "$MKDIR_BIN" -p "$EXTRACT_DIR"
+
+    # tarsnap -x reads each line of -T as a pattern, glob characters and
+    # backslash included (fnmatch(3) with FNM_LEADING_DIR): a name holding
+    # "*", "?", "[" or a backslash would extract other files, or nothing
+    # at all. tarsnap therefore gets an escaped copy of the list (N-R1-9,
+    # TD-15), to which the target of every hard link among the candidates
+    # is added: tarsnap can only recreate a link next to its target
+    # (TD-04). A target that step 2 could not find, written "?", is left
+    # out: the link will not be downloaded, and its verdict will say so.
+    LC_ALL=C "$SORT_BIN" -t "$TAB" -k1,1 "$HARD_LIST" -o "$HARD_BY_NAME"
+    {
+        "$CAT_BIN" "$CANDIDATES"
+        LC_ALL=C "$JOIN_BIN" -t "$TAB" -o 1.2 "$HARD_BY_NAME" "$CANDIDATES" \
+            | "$GREP_BIN" -v -x -F '?' || true
+    } | LC_ALL=C "$SED_BIN" 's/[][*?\\]/\\&/g' | LC_ALL=C "$SORT_BIN" -u > "$PATTERNS"
 
     # A SINGLE tarsnap invocation for the whole list. The -T option reads
     # the names from a file and -C places the extraction in the temporary
@@ -1509,29 +1539,56 @@ if [ "$cand_count" -gt 0 ]; then
         # nobody can see.
         # shellcheck disable=SC2086
         LC_ALL=en_US.UTF-8 "$TARSNAP_BIN" $TARSNAP_KEYOPT --no-config-exclude \
-            --no-config-include -x -C "$EXTRACT_DIR" \
-            -f "$SNAPSHOT_NAME" -T "$CANDIDATES" || rc=$?
+            --no-config-include --no-same-owner --no-same-permissions \
+            -x -C "$EXTRACT_DIR" -f "$SNAPSHOT_NAME" -T "$PATTERNS" || rc=$?
     else
         # shellcheck disable=SC2086
         LC_ALL=en_US.UTF-8 "$TARSNAP_BIN" $TARSNAP_KEYOPT --no-config-exclude \
-            --no-config-include -x -C "$EXTRACT_DIR" \
-            -f "$SNAPSHOT_NAME" -T "$CANDIDATES" 2> "$TARSNAP_ERR" || rc=$?
+            --no-config-include --no-same-owner --no-same-permissions \
+            -x -C "$EXTRACT_DIR" -f "$SNAPSHOT_NAME" -T "$PATTERNS" \
+            2> "$TARSNAP_ERR" || rc=$?
     fi
     spin_stop
+    # A failed extraction may have left partial copies behind, a file cut
+    # short or filled with zeros: none of them is compared, and all the
+    # candidates are reported as modified, a cautious verdict that the
+    # header of the log explains (N-R2-14).
     if [ "$rc" -ne 0 ]; then
-        printf 'WARNING: "tarsnap -x" returned %s, the byte-by-byte comparison\n' "$rc" >&2
+        EXTRACT_FAILED=$rc
+        printf 'WARNING: "tarsnap -x" returned %s: a copy may be partial, so none is\n' "$rc" >&2
+        printf '         compared, and the %s file(s) to check are reported as modified.\n' \
+            "$cand_count" >&2
         if [ "$KEY_MAY_PROMPT" -eq 1 ]; then
-            printf '         may therefore be incomplete. See the message from tarsnap above.\n' >&2
+            printf '         See the message from tarsnap above.\n' >&2
         else
-            printf '         may therefore be incomplete. Message from tarsnap:\n' >&2
+            printf '         Message from tarsnap:\n' >&2
             "$SED_BIN" 's/^/  /' "$TARSNAP_ERR" >&2
         fi
     fi
 
     say "Byte-by-byte comparison."
     {
-        while read -r path; do
+        while IFS= read -r path; do
             [ -n "$path" ] || continue
+            if [ "$EXTRACT_FAILED" -ne 0 ]; then
+                printf '*\t%s\n' "$path"
+                continue
+            fi
+            # cmp follows symbolic links: a copy or a file that is not, or
+            # no longer, a regular file is not compared (TD-03).
+            if [ -h "/$path" ] || [ ! -f "/$path" ]; then
+                printf 'WARNING: no longer a regular file, verdict forced to "modified": %s\n' \
+                    "$path" >&2
+                printf '*\t%s\n' "$path"
+                continue
+            fi
+            if [ -h "$EXTRACT_DIR/$path" ] || { [ -e "$EXTRACT_DIR/$path" ] &&
+                    [ ! -f "$EXTRACT_DIR/$path" ]; }; then
+                printf 'WARNING: extracted as something other than a regular file, verdict forced to "modified": %s\n' \
+                    "$path" >&2
+                printf '*\t%s\n' "$path"
+                continue
+            fi
             if [ ! -e "$EXTRACT_DIR/$path" ]; then
                 # Not downloaded: nothing can be asserted, so we take good
                 # care not to claim that it is identical. Cautious verdict.
@@ -1602,6 +1659,10 @@ LOGFILE_TMP=$("$MKTEMP_BIN" "${LOGFILE}.XXXXXXXX") \
     printf '# date        : %s\n'      "$STARTED_AT"
     printf '# directories : %s\n'      "$BACKUP_DIRS"
     printf '# exclusions  : %s\n'      "$BACKUP_EXCLUDE"
+    if [ "$EXTRACT_FAILED" -ne 0 ]; then
+        printf '# extraction  : tarsnap -x failed (exit code %s), no copy compared,\n' "$EXTRACT_FAILED"
+        printf '#               the files to check are reported as modified\n'
+    fi
     if [ -n "$CONF_EXCLUDE" ]; then
         printf '# tarsnap.conf: %s\n'      "$CONF_EXCLUDE"
     fi
