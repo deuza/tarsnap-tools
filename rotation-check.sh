@@ -261,12 +261,28 @@ case "$DAYS" in
             "without a leading zero" ;;
 esac
 
-# Same calculations as the script under test: CUMULATIVE windows, each tier
-# takes over where the previous one stops.
+# Same calculations as tarsnap-backup.sh, line for line: CUMULATIVE
+# windows, each tier takes over where the previous one stops.
 NOW_UNIX=$("$DATE_BIN" +%s)
 DAILY_SEC=$((DAILY * 86400))
 WEEKLY_SEC=$((DAILY_SEC + WEEKLY * 604800))
-MONTHLY_UNIX=$(($("$DATE_BIN" -d "-${MONTHLY} months" +%s) - WEEKLY_SEC))
+#
+# The monthly bound is MONTHLY months before today, on the same day of the
+# month, brought back to the last day of that month when it is shorter.
+# "date -d -N months" would instead spill over into the following month
+# (31 August minus 6 months gives 3 March): the bound would then move back
+# at the end of some months, and an archive could be kept, deleted, then
+# kept again. Noon, for the days without midnight.
+MONTHLY_DAY=$("$DATE_BIN" +%-d)
+MONTHLY_YM=$("$DATE_BIN" +%Y-%m-15)
+MONTHLY_YM=$("$DATE_BIN" -d "$MONTHLY_YM 12:00 ${MONTHLY} months ago" +%Y-%m)
+MONTHLY_LAST=$("$DATE_BIN" -d "${MONTHLY_YM}-15 12:00 1 month" +%Y-%m-01)
+MONTHLY_LAST=$("$DATE_BIN" -d "$MONTHLY_LAST 12:00 1 day ago" +%-d)
+if [ "$MONTHLY_DAY" -gt "$MONTHLY_LAST" ]; then
+    MONTHLY_DAY=$MONTHLY_LAST
+fi
+MONTHLY_UNIX=$("$DATE_BIN" -d "${MONTHLY_YM}-${MONTHLY_DAY} 12:00" +%s)
+MONTHLY_UNIX=$((MONTHLY_UNIX - WEEKLY_SEC))
 
 # Temporary files, all in one directory, removed whatever the way out.
 #
@@ -326,28 +342,87 @@ if [ "$WEEKLY" -lt 1 ]; then
     printf 'WARNING: WEEKLY=%s, the weekly tier is disabled.\n\n' \
         "$WEEKLY"
 fi
-if [ "$MONTHLY_UNIX" -ge "$((NOW_UNIX - WEEKLY_SEC))" ]; then
+# MONTHLY=0 is tested as such: the monthly bound is now taken at noon, and
+# comparing it with the end of the weekly window only caught MONTHLY=0 in
+# the morning.
+if [ "$MONTHLY" -lt 1 ]; then
     ANOMALIE=1
     printf 'WARNING: MONTHLY=%s does not extend beyond the weekly window,\n' \
         "$MONTHLY"
     printf '         the monthly tier keeps nothing older than it.\n\n'
 fi
 
-# Decision for one archive, from its epoch, its day of the week and its day
-# of the month. Writes the verdict into DECISION: son, father, gfather or
-# purge.
+# Strict stamp of the archive names, YYYY-MM-DD_HH-MM-SS. The digits are
+# written in full rather than as the range [0-9]: the content of a range
+# depends on the locale, and under bash [0-9] also matches digits other
+# than 0 to 9. The expansion is left unquoted where it is used, so that it
+# acts as a pattern and not as a literal string.
+_digit='[0123456789]'
+STAMP_GLOB="${_digit}${_digit}${_digit}${_digit}-${_digit}${_digit}"
+STAMP_GLOB="${STAMP_GLOB}-${_digit}${_digit}_${_digit}${_digit}"
+STAMP_GLOB="${STAMP_GLOB}-${_digit}${_digit}-${_digit}${_digit}"
+
+# Decision for one archive, taken as in the loop of tarsnap-backup.sh,
+# condition for condition: same order, same bounds, same sets of the weeks
+# and months already represented, the archives coming in chronological
+# order. The caller computes the dates beforehand, with the date
+# expressions of the backup, into the globals of the same names:
+#   f_unix  midnight of the archive day, as noon minus 12 hours
+#   w_key   first day of its week, the last day DOW, as YYYY-MM-DD
+#   w_unix  midnight of that first day
+#   m_key   month the archive belongs to, counted from day DOM, as YYYY-MM
+#   m_unix  midnight of the first day of that month
+# Writes the verdict into DECISION: son, father, gfather or purge.
 decide() {
-    _unix=$1; _dow=$2; _dom=$3
-    _age=$((NOW_UNIX - _unix))
-    if [ "$_age" -lt "$DAILY_SEC" ]; then
+    age=$((NOW_UNIX - f_unix))
+
+    # Son: everything that is recent.
+    if [ "$age" -lt "$DAILY_SEC" ]; then
         DECISION=son
-    elif [ "$_dow" -eq "$DOW" ] && [ "$_age" -lt "$WEEKLY_SEC" ]; then
-        DECISION=father
-    elif [ "$_dom" -eq "$DOM" ] && [ "$_unix" -gt "$MONTHLY_UNIX" ]; then
-        DECISION=gfather
-    else
-        DECISION=purge
+        return 0
     fi
+
+    # Month of the archive, only while the archive is newer than the
+    # monthly bound, as the backup only computes it then: an older month
+    # can no longer count.
+    if [ "$f_unix" -le "$MONTHLY_UNIX" ]; then
+        m_key=""
+        m_unix=0
+    fi
+
+    # Father: the first archive of each week, a week starting on day DOW,
+    # as long as that day lies within the weekly window. A missed night of
+    # DOW no longer leaves the week without any archive (N-R2-3). The
+    # archive kept also represents its month.
+    if [ "$age" -lt "$WEEKLY_SEC" ]; then
+        if [ $((NOW_UNIX - w_unix)) -lt "$WEEKLY_SEC" ]; then
+            case "$SEEN_WEEKS" in
+                *" $w_key "*) ;;
+                *)
+                    SEEN_WEEKS="$SEEN_WEEKS$w_key "
+                    SEEN_MONTHS="$SEEN_MONTHS$m_key "
+                    DECISION=father
+                    return 0
+                    ;;
+            esac
+        fi
+    fi
+
+    # Grandfather: the first archive of each month, as long as its first
+    # day lies within the monthly window (N-R2-3).
+    if [ -n "$m_key" ] && [ "$m_unix" -gt "$MONTHLY_UNIX" ]; then
+        case "$SEEN_MONTHS" in
+            *" $m_key "*) ;;
+            *)
+                SEEN_MONTHS="$SEEN_MONTHS$m_key "
+                DECISION=gfather
+                return 0
+                ;;
+        esac
+    fi
+
+    DECISION=purge
+    return 0
 }
 
 # Replay mode: prints the name of an archive, indented by two spaces and
@@ -362,6 +437,12 @@ print_verdict() {
 }
 
 kd=0; kw=0; km=0; del=0; skip=0
+
+# Weeks and months already represented, as " key key ... ": in both modes
+# the archives come in chronological order, so that the first archive of
+# each period is the one kept.
+SEEN_WEEKS=" "
+SEEN_MONTHS=" "
 
 if [ -n "$LISTFILE" ]; then
     ###########################################################################
@@ -383,7 +464,7 @@ if [ -n "$LISTFILE" ]; then
     # longest name of the list, so that a long snapshot name does not shift
     # the verdicts.
     NAME_WIDTH=32
-    while read -r archive; do
+    while IFS= read -r archive; do
         if [ "${#archive}" -gt "$NAME_WIDTH" ]; then
             NAME_WIDTH=${#archive}
         fi
@@ -391,13 +472,19 @@ if [ -n "$LISTFILE" ]; then
 
     printf 'Replay against the real list, hostname "%s":\n\n' "$COMPUTER"
 
-    while read -r archive; do
+    # One archive per line, read whole, as in tarsnap-backup.sh: blanks at
+    # either end belong to the name and keep it outside the pattern, where
+    # they used to be trimmed and the name decided as a regular one
+    # (N-R1-11).
+    while IFS= read -r archive; do
+        # Empty line: the account holds no archive at all.
         [ -n "$archive" ] || continue
+        # shellcheck disable=SC2254
         case "$archive" in
             *.part)
                 print_verdict "$archive" "PARTIAL, left in place"
                 skip=$((skip + 1)); continue ;;
-            "${COMPUTER}-"[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+            "${COMPUTER}-"$STAMP_GLOB)
                 ;;
             *)
                 print_verdict "$archive" "outside the pattern, untouchable"
@@ -406,9 +493,28 @@ if [ -n "$LISTFILE" ]; then
 
         stamp=${archive#"${COMPUTER}-"}
         day=${stamp%%_*}
-        # shellcheck disable=SC2046
-        set -- $("$DATE_BIN" -d "$day" '+%s %w %-d')
-        decide "$1" "$2" "$3"
+
+        # Same date expressions as tarsnap-backup.sh, archive by archive:
+        # noon of the day, whose midnight is taken as noon minus 12 hours,
+        # since a change to summer time can skip midnight itself (N-R1-13).
+        # A date that does not exist is kept by the backup with a warning:
+        # it gets a verdict of its own here, and no longer stops the replay
+        # (TB-04, RC-04). The relative item comes first: placed after a
+        # time, "-N" would be read as a time zone offset.
+        if ! f_noon=$("$DATE_BIN" -d "$day 12:00" +%s 2>/dev/null); then
+            print_verdict "$archive" "impossible date, kept"
+            skip=$((skip + 1)); continue
+        fi
+        f_unix=$((f_noon - 43200))
+        f_dow=$("$DATE_BIN" -d "$day 12:00" +%w)
+        w_back=$(( (f_dow - DOW + 7) % 7 ))
+        w_ref=$("$DATE_BIN" -d "-$w_back days $day 12:00" '+%F %s')
+        w_key=${w_ref% *}
+        w_unix=$((${w_ref#* } - 43200))
+        m_key=$("$DATE_BIN" -d "-$((DOM - 1)) days $day 12:00" +%Y-%m)
+        m_ref=$("$DATE_BIN" -d "+$((DOM - 1)) days ${m_key}-01 12:00" +%s)
+        m_unix=$((m_ref - 43200))
+        decide
 
         case "$DECISION" in
             son)     kd=$((kd + 1));   verdict="KEPT  (son, daily)" ;;
@@ -425,27 +531,58 @@ else
     ###########################################################################
     printf 'Simulation over %s days, one archive per day...\n' "$DAYS"
 
-    # Two calls to date for the whole history, instead of four per day: the
-    # previous version forked 7300 times for 5 years and looked as if it had
-    # hung.
-    # First pass: the relative dates become YYYY-MM-DD.
-    # Second pass: those days become the epoch at midnight, the day of the
-    # week and the day of the month, exactly as the script under test does.
-    i=0
-    while [ "$i" -lt "$DAYS" ]; do
-        printf -- '-%s days\n' "$i"
-        i=$((i + 1))
-    done | "$DATE_BIN" -f - +%F | "$DATE_BIN" -f - '+%s %w %-d' > "$TMP"
+    # The dates of the whole history come from a few calls to date, each
+    # fed one expression per line: archive by archive, as in the replay,
+    # five years would take some 9000 forks, and the tool already looked as
+    # if it had hung at 7300. The expressions are those of the replay and
+    # of tarsnap-backup.sh, and the decision is the same function.
+    #
+    # The days of the history come oldest first, as the backup sees them
+    # after its sort, and are counted from noon of today: "-N days" from
+    # now kept the summer or winter time of the moment, so that a run in
+    # the hour after midnight shifted a whole season by one day
+    # (N-GAP2-6). The archive of the run itself, which tarsnap-backup.sh
+    # never purges in the same run (N-R1-12), needs no special case: the
+    # archive of the day always falls into the son tier, DAILY being at
+    # least 1.
+    TODAY=$("$DATE_BIN" +%F)
+    i=$DAYS
+    while [ "$i" -gt 0 ]; do
+        i=$((i - 1))
+        printf '%s 12:00 %s days ago\n' "$TODAY" "$i"
+    done | "$DATE_BIN" -f - +%F > "$TMP_DIR/days"
 
-    while read -r f_unix f_dow f_dom; do
-        decide "$f_unix" "$f_dow" "$f_dom"
+    # Noon of each day: epoch and day of the week.
+    "$SED_BIN" 's/$/ 12:00/' "$TMP_DIR/days" |
+        "$DATE_BIN" -f - '+%s %w' > "$TMP_DIR/noon"
+
+    # Two lines per day: the first day of its week, then the day that
+    # names its month, DOM - 1 days earlier.
+    while IFS= read -r day <&3 && read -r f_noon f_dow <&4; do
+        w_back=$(( (f_dow - DOW + 7) % 7 ))
+        printf -- '-%s days %s 12:00\n' "$w_back" "$day"
+        printf -- '-%s days %s 12:00\n' "$((DOM - 1))" "$day"
+    done 3< "$TMP_DIR/days" 4< "$TMP_DIR/noon" |
+        "$DATE_BIN" -f - '+%F %s %Y-%m' > "$TMP_DIR/periods"
+
+    # First day of each of those months.
+    while read -r _ && read -r _ _ m_key; do
+        printf '+%s days %s-01 12:00\n' "$((DOM - 1))" "$m_key"
+    done < "$TMP_DIR/periods" | "$DATE_BIN" -f - +%s > "$TMP_DIR/months"
+
+    while read -r f_noon f_dow <&3 && read -r w_key w_epoch _ <&4 &&
+        read -r _ _ m_key <&4 && read -r m_ref <&5; do
+        f_unix=$((f_noon - 43200))
+        w_unix=$((w_epoch - 43200))
+        m_unix=$((m_ref - 43200))
+        decide
         case "$DECISION" in
             son)     kd=$((kd + 1)) ;;
             father)  kw=$((kw + 1)) ;;
             gfather) km=$((km + 1)) ;;
             *)       del=$((del + 1)) ;;
         esac
-    done < "$TMP"
+    done 3< "$TMP_DIR/noon" 4< "$TMP_DIR/periods" 5< "$TMP_DIR/months"
     printf '\n'
 fi
 
