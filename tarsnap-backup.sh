@@ -796,6 +796,20 @@ set --
 # The naming pattern forbids spaces, so splitting on IFS is safe.
 for archive in $ARCHIVES; do
 
+    # The archive this very run created is never purged by its own run,
+    # whatever the clock says. Its name is fixed before the creation and
+    # NOW_UNIX is taken after it, so a run started late in the evening, a
+    # creation that crosses midnight, the 25-hour day of the switch to
+    # winter time, or a first full backup that lasts several days can push
+    # its age past DAILY days; on a day that is neither DOW nor DOM, it
+    # would then go with the purge, and the run would leave no archive at
+    # all. In --dry-run nothing is created, so the name is never listed and
+    # the simulation is unchanged.
+    if [ "$archive" = "$NAME" ]; then
+        say "Archive just created, kept: $archive"
+        continue
+    fi
+
     # Main safeguard: we touch ONLY what exactly matches
     # "hostname-YYYY-MM-DD_HH-MM-SS".
     # Everything else (snapshots created by hand) is beyond the reach of
