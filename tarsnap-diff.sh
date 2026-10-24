@@ -1297,12 +1297,15 @@ fi
 
 # The walk covers what tarsnap -c archives, and nothing more (N-GAP2-2):
 # - the cache directory of tarsnap stays out, as tarsnap leaves it out
-#   (tar/write.c:956-968), and so do the temporary directory and the
+#   (tar/write.c:958-968), and so do the temporary directory and the
 #   working file of this script (N-GAP2-3);
 # - unless tarsnap.conf has insane-filesystems, the mount point of a
-#   synthetic file system is listed but not entered, as tar/write.c:871-896
-#   does, for the Linux types of synthetic_filesystems[] in
-#   lib-platform/util/ts_getfstype.c;
+#   synthetic file system crossed during the walk is listed but not
+#   entered, as tar/write.c:871-896 does, for the Linux types of
+#   synthetic_filesystems[] in lib-platform/util/ts_getfstype.c. A
+#   directory of BACKUP_DIRS that lies itself on such a file system is
+#   entered: tarsnap only checks the file systems that it crosses, the one
+#   of the starting point being accepted from the outset (tar/write.c:863);
 # - a name holding a newline or a tab stays out, with everything below it,
 #   and is counted: the inventory is made of lines of tab-separated fields,
 #   where such a name could forge or hide entries (N-R1-1);
@@ -1343,9 +1346,22 @@ for dir in $BACKUP_DIRS; do
     fi
     set -- "$@" \) -prune -o \( -name "*$NL*" -o -name "*$TAB*" \) -printf '!\n' -prune -o
     if [ "$INSANE_FS" -eq 0 ]; then
-        set -- "$@" \( -fstype proc -o -fstype sysfs -o -fstype devpts \
-            -o -fstype securityfs -o -fstype selinuxfs -o -fstype usbfs \
-            -o -fstype devfs \) -printf "$FIND_FMT" -prune -o
+        # The type of the file system of the starting point, which is not
+        # crossed, leaves the list.
+        _start_fs=$("$FIND_BIN" "$dir" -maxdepth 0 -printf '%F' 2>/dev/null) \
+            || _start_fs=""
+        set -- "$@" \(
+        _first=1
+        for _fs in proc sysfs devpts securityfs selinuxfs usbfs devfs; do
+            [ "$_fs" != "$_start_fs" ] || continue
+            if [ "$_first" -eq 1 ]; then
+                _first=0
+            else
+                set -- "$@" -o
+            fi
+            set -- "$@" -fstype "$_fs"
+        done
+        set -- "$@" \) -printf "$FIND_FMT" -prune -o
     fi
     set -- "$@" -printf "$FIND_FMT"
     _frc=0
