@@ -110,6 +110,18 @@ while getopts "D:f:d:w:m:o:M:l:h" opt; do
     esac
 done
 
+# getopts stops at the first operand and leaves it, with everything after
+# it, in $@. The script takes none: an operand is a mistyped option, such
+# as "l -" without its dash, which used to run a simulation and ignore the
+# list without a word. Refused, with the help, as in tarsnap-backup.sh.
+shift $((OPTIND - 1))
+if [ "$#" -gt 0 ]; then
+    printf 'ERROR: unexpected argument: %s\n' "$1" >&2
+    printf '  options start with an ASCII "-", and a dash pasted from a\n' >&2
+    printf '  document is not one\n' >&2
+    usage 1
+fi
+
 # --- Safeguards ---
 # All the configured binaries must be executable. The check comes after the
 # options, so that -h keeps working even if one of them is missing.
@@ -126,7 +138,15 @@ if [ -z "$BACKUP_SCRIPT" ]; then
         */*) HERE=${0%/*} ;;
         *)   HERE="." ;;
     esac
-    if [ -r "$BACKUP_SCRIPT_INSTALLED" ]; then
+    if [ -e "$BACKUP_SCRIPT_INSTALLED" ]; then
+        # An installed copy that cannot be read stops the tool, instead of
+        # a silent fall back on the copy of the repository: production
+        # often runs with other values, and the result would describe a
+        # rotation that cron never runs (N-R1-21, RC-05).
+        if [ ! -r "$BACKUP_SCRIPT_INSTALLED" ]; then
+            die "$BACKUP_SCRIPT_INSTALLED exists but is not readable," \
+                "run as root or use -f"
+        fi
         BACKUP_SCRIPT=$BACKUP_SCRIPT_INSTALLED
     elif [ -r "$HERE/tarsnap-backup.sh" ]; then
         BACKUP_SCRIPT="$HERE/tarsnap-backup.sh"
@@ -248,8 +268,38 @@ DAILY_SEC=$((DAILY * 86400))
 WEEKLY_SEC=$((DAILY_SEC + WEEKLY * 604800))
 MONTHLY_UNIX=$(($("$DATE_BIN" -d "-${MONTHLY} months" +%s) - WEEKLY_SEC))
 
-TMP=$("$MKTEMP_BIN") || exit 1
-trap '"$RM_BIN" -f "$TMP"' EXIT HUP INT TERM
+# Temporary files, all in one directory, removed whatever the way out.
+#
+# SC2317 and SC2329 are disabled here: shellcheck does not follow calls
+# made from a trap, and therefore believes the whole body is dead (SC2317)
+# or the function never invoked (SC2329, from ShellCheck 0.11.0 on). It is
+# not.
+# shellcheck disable=SC2317,SC2329
+cleanup() {
+    if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
+        "$RM_BIN" -rf "$TMP_DIR"
+    fi
+    return 0
+}
+
+# The signal handlers EXIT after cleaning up, and that is the whole point
+# of separating them from the EXIT trap. The former single trap removed
+# the temporary file and let the script carry on: depending on the moment,
+# it stopped on an unrelated error, or printed its summary and ended with
+# status 0 as if nothing had happened (RC-02). Exit codes 128 + signal
+# number, as a shell does. Same handlers as in tarsnap-diff.sh.
+TMP_DIR=""
+trap 'cleanup' EXIT
+trap 'cleanup; exit 129' HUP
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+# mktemp without a template creates $TMPDIR/tmp.XXXXXXXXXX, a name that
+# means nothing to anyone when it turns up in an error message. With a
+# template, it announces itself.
+TMP_DIR=$("$MKTEMP_BIN" -d "${TMPDIR:-/tmp}/rotation-check.XXXXXXXX") \
+    || die "cannot create the temporary directory in ${TMPDIR:-/tmp}"
+TMP="$TMP_DIR/list"
 
 printf 'tarsnap-backup: rotation consistency check\n'
 printf -- '------------------------------------------\n'
