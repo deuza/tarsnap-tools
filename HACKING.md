@@ -23,9 +23,9 @@ Using the suite only requires the [README](README.md).
 | `tarsnap-backup.sh` | backup and rotation, carries the configuration |
 | `rotation-check.sh` | replays the rotation logic, never runs Tarsnap |
 | `tarsnap-diff.sh` | compares a snapshot with the system, read-only |
-| `tarsnap-stats.sh` | sizes, deduplication and cost, copied from its own repository |
+| `tarsnap-stats.sh` | sizes, deduplication and cost, also published in its own repository |
 
-`tarsnap-stats.sh` is maintained in [deuza/tarsnap-stats](https://github.com/deuza/tarsnap-stats), which remains its source of truth: it is never modified here, only resynchronised from there, and a fix goes upstream first.
+`tarsnap-stats.sh` is developed here, like the other scripts. Each change is then copied to [deuza/tarsnap-stats](https://github.com/deuza/tarsnap-stats), the repository that tarsnap.com lists among its helper scripts, and committed and pushed there, next to a README of its own, adapted to the script alone.
 
 The scripts are written in strictly POSIX `sh` and run under `dash`, `bash` and `busybox sh`, `posh` excepted (see [Validation](#validation)), but they target Debian on purpose: binaries under `/usr/bin` (`usrmerge`), GNU `date -d` and `%-d`, GNU `find -printf`, and GNU `sed` reading the binary content of a raw key file.
 
@@ -34,7 +34,7 @@ The scripts are written in strictly POSIX `sh` and run under `dash`, `bash` and 
 A change that breaks one of these is a regression, whatever it gains elsewhere.
 
 - **Creation before deletion.** The new archive exists before the purge starts, and a failure anywhere before that point deletes nothing.
-- **`set -euf`.** Exit on the first error, unset variables are fatal, and no pathname expansion at all: `-f` disables globbing everywhere, patterns written out in full included, not only on unquoted expansions. The hooks get it back, see [Technical choices](#technical-choices). `tarsnap-stats.sh` follows its own repository, with `set -eu`.
+- **`set -euf`.** Exit on the first error, unset variables are fatal, and no pathname expansion at all: `-f` disables globbing everywhere, patterns written out in full included, not only on unquoted expansions. The hooks get it back, see [Technical choices](#technical-choices). `tarsnap-stats.sh` uses `set -eu`.
 - **`umask 077`.** Set right after `set -euf`, before anything is created: the lock, the package inventories and the dumps of `prebackup` are private to root (N-R1-4).
 - **`flock` lock on descriptor 9.** The Tarsnap manual forbids two concurrent create or delete operations with the same key, and the lock keeps two runs of this machine from overlapping. It is local to the host: two machines sharing a key are not serialised by it, hence one key per machine (N-GAP1-2). The lock is held by an open descriptor, so the kernel releases it when the process dies, `kill -9`, OOM and power failure included: no stale lock file, and no race between an existence test and a `touch`.
 - **Two protections for the lock file.** `/run`, mode 755 and owned by root, reserves the creation and the replacement of the file to root, and the mode 0600 of the file, given by the umask, keeps other users from opening it at all: `flock(2)` also locks a descriptor opened read-only, so a lock readable by all could be held by any local user, blocking the backups (N-R1-5). A lock left in mode 0644 by an earlier version is brought back to 0600 once held, which does not revoke a descriptor that another user already has open: reboot, `/run` being a tmpfs, or delete the file while no backup is running.
@@ -55,18 +55,18 @@ A change that breaks one of these is a regression, whatever it gains elsewhere.
 
 | Variables | Read by | Expected form |
 |---|---|---|
-| `DAILY`, `WEEKLY`, `MONTHLY`, `DOW`, `DOM` | `rotation-check.sh` | `NAME=` followed by digits, unquoted |
+| `DAILY`, `WEEKLY`, `MONTHLY`, `DOW`, `DOM` | `rotation-check.sh` | `NAME=` followed by a decimal integer, unquoted, on a single line, which `check_retention()` then validates |
 | `TARSNAP_KEY`, `TARSNAP_PASSPHRASE`, `BACKUP_DIRS`, `BACKUP_EXCLUDE` | `tarsnap-diff.sh` | `NAME="..."`, possibly empty, no double quote inside |
 
 Hence:
 
 - Renaming one of these variables breaks the tool that reads it.
-- Only the first line starting with `NAME=` counts, whereas the shell keeps the last assignment: a second definition further down would make the tools and the backup disagree.
+- `tarsnap-diff.sh` only reads the first line starting with `NAME=`, whereas the shell keeps the last assignment: a second definition further down would make the tool and the backup disagree. `rotation-check.sh` refuses a variable assigned on more than one line, and a quoted value.
 - The value is taken literally: no `$VARIABLE` expansion, and no quoting other than the one above.
 - A string value stops at the first double quote after the opening one: a trailing comment may contain double quotes, the value itself cannot.
 - A missing variable stops the tool that reads it: `tarsnap-diff.sh` therefore needs a `tarsnap-backup.sh` that already has `TARSNAP_PASSPHRASE`, and stops with `variable TARSNAP_PASSPHRASE not found` otherwise.
 
-Both tools look for `/usr/local/sbin/tarsnap-backup.sh` first, then for a `tarsnap-backup.sh` in their own directory, unless `-f` names another one.
+Both tools look for `/usr/local/sbin/tarsnap-backup.sh` first, then for a `tarsnap-backup.sh` in their own directory, unless `-f` names another one. `rotation-check.sh` stops when the installed file exists but cannot be read, rather than falling back silently on the copy of the repository (N-R1-21); `tarsnap-diff.sh` does not do so yet.
 
 ## Validation
 
@@ -145,7 +145,7 @@ Within a hook, `set -e` only stops the script on a command that fails on a line 
 
 **Long options translated by hand.** POSIX `getopts` only knows single-character options. The long forms, with one or two leading dashes, are rewritten into short ones before `getopts` runs. `tarsnap-diff.sh` maps `--debug` to `-X`, a letter deliberately left out of the documented short options. Every script refuses the operands it does not expect: `getopts` stops at the first operand, so a mistyped option, `dry-run` without its dashes or behind a dash pasted from a document, would otherwise be ignored, and a dry-run asked for would become a real run (N-R1-2).
 
-**Absolute binary paths, checked at startup.** They do not depend on the caller's `PATH`, be it `cron`, `systemd` or a misconfigured `sudo`, and a missing binary stops the script before anything else happens. The only exception is `usage()`, which calls `cat` by name: it can be reached through `-h` before the check, and must still display the help.
+**Absolute binary paths, checked at startup.** They do not depend on the caller's `PATH`, be it `cron`, `systemd` or a misconfigured `sudo`, and a missing binary stops the script before anything else happens. The only exception is `usage()`, which calls `cat` by name: it can be reached through `-h` before the check, and must still display the help. `tarsnap-stats.sh` departs from the rule as a whole: like the version in its own repository, it finds its binaries through `PATH`, and `tarsnap` through the `TARSNAP` variable when it is set.
 
 **`en_US.UTF-8` locale forced.** Tarsnap, `apt` and `date` then produce predictable output. `LANGUAGE` is unset, since GNU gettext would otherwise override `LC_MESSAGES`.
 
