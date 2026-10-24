@@ -136,19 +136,73 @@ if [ -z "$BACKUP_SCRIPT" ]; then
 fi
 [ -r "$BACKUP_SCRIPT" ] || die "not readable: $BACKUP_SCRIPT"
 
-# Reading an integer value from the script under test.
+# Reading a value from the script under test, as the shell would assign
+# it.
 #
 # The file is NOT sourced: that would trigger its option parsing, its lock
 # and, in the end, a real backup.
-# An anchored sed is enough. It stops at the first match and, along the
-# way, checks that the value really is an integer.
+# The value is the first word after "NAME=", up to a blank or to one of the
+# characters that end a word for the shell, ;&|<>(), and it is kept whole:
+# "1#Monday", or "1" followed by the CR of DOS line endings, reach
+# check_retention() as they are and are refused there, as tarsnap-backup.sh
+# refuses them. Keeping only the leading digits used to announce a rotation
+# that the backup would never run (N-R1-7).
+# A quoted value is refused with its own message, the expected form being
+# unquoted (HACKING.md), and so is a second line assigning the same name:
+# the shell keeps the last assignment, and a tool reading the first one
+# would read another value than the backup.
 # Anchoring on "^NAME=" rules out namesakes such as DAILY_SEC, which do not
 # start with "DAILY=".
 
 read_value() {
-    _v=$("$SED_BIN" -n "/^$1=/{s/^$1=\([0-9][0-9]*\).*/\1/p;q;}" "$BACKUP_SCRIPT")
-    [ -n "$_v" ] || die "value $1 not found or not numeric in $BACKUP_SCRIPT"
+    _lines=$("$SED_BIN" -n "/^$1=/=" "$BACKUP_SCRIPT")
+    case "$_lines" in
+        "")
+            die "value $1 not found in $BACKUP_SCRIPT" ;;
+        *[!0123456789]*)
+            die "$1 is assigned on more than one line in $BACKUP_SCRIPT" ;;
+    esac
+    _v=$("$SED_BIN" -n \
+        "${_lines}s/^$1=\([^[:blank:];&|<>()]*\).*/\1/p" "$BACKUP_SCRIPT")
+    case "$_v" in
+        \"*|\'*)
+            die "$1 is quoted in $BACKUP_SCRIPT, write it without quotes" ;;
+    esac
     printf '%s\n' "$_v"
+}
+
+# Retention values, refused under the same conditions as in
+# tarsnap-backup.sh: decimal integers without a leading zero, which the
+# shell would read as octal, five digits at most, DAILY of at least 1, DOW
+# from 0 to 6 as date +%w counts, DOM from 1 to 31. Out-of-range values
+# used to pass here and end with "consistent" (RC-01). The function is a
+# copy of the one in tarsnap-backup.sh and must stay identical to it, byte
+# for byte, see HACKING.md: a value the backup refuses is refused here, and
+# only such a value.
+check_retention() {
+    set -- DAILY "$DAILY" WEEKLY "$WEEKLY" MONTHLY "$MONTHLY" \
+        DOW "$DOW" DOM "$DOM"
+    while [ "$#" -ge 2 ]; do
+        case "$2" in
+            ""|*[!0123456789]*|0?*)
+                die "$1 must be a decimal integer, without a leading zero"
+                ;;
+            ??????*)
+                die "$1 must have at most 5 digits"
+                ;;
+        esac
+        shift 2
+    done
+    if [ "$DAILY" -lt 1 ]; then
+        die "DAILY must be at least 1"
+    fi
+    if [ "$DOW" -gt 6 ]; then
+        die "DOW must be between 0 (Sunday) and 6 (Saturday)"
+    fi
+    if [ "$DOM" -lt 1 ] || [ "$DOM" -gt 31 ]; then
+        die "DOM must be between 1 and 31"
+    fi
+    return 0
 }
 
 DAILY=$(read_value DAILY)
@@ -156,6 +210,12 @@ WEEKLY=$(read_value WEEKLY)
 MONTHLY=$(read_value MONTHLY)
 DOW=$(read_value DOW)
 DOM=$(read_value DOM)
+
+# The values of the file are checked before the overrides, so that an
+# option cannot hide a value that the backup would refuse. Since
+# check_retention() must not change, it does not say where a value comes
+# from: it runs in a subshell, and a second line names the source.
+( check_retention ) || die "value read from $BACKUP_SCRIPT"
 
 # The overrides come after the reading, so that a scenario can be compared
 # with the real configuration without touching the script.
@@ -170,6 +230,16 @@ if [ -n "$OPT_WEEKLY" ];  then WEEKLY=$OPT_WEEKLY;   fi
 if [ -n "$OPT_MONTHLY" ]; then MONTHLY=$OPT_MONTHLY; fi
 if [ -n "$OPT_DOW" ];     then DOW=$OPT_DOW;         fi
 if [ -n "$OPT_DOM" ];     then DOM=$OPT_DOM;         fi
+( check_retention ) || die "value given on the command line"
+
+# The simulated horizon follows the same rules, from 1 to 99999 days. It is
+# not a retention value and stays out of check_retention(), which must not
+# drift from the one of tarsnap-backup.sh.
+case "$DAYS" in
+    ""|*[!0123456789]*|0*|??????*)
+        die "-D must be a decimal integer from 1 to 99999," \
+            "without a leading zero" ;;
+esac
 
 # Same calculations as the script under test: CUMULATIVE windows, each tier
 # takes over where the previous one stops.
@@ -197,8 +267,9 @@ printf 'monthly    MONTHLY=%-2s DOM=%-2s           from %5s to %5s d\n\n' \
 # With cumulative windows the invariant is structural: each bound is
 # computed from the previous one, a tier can no longer be swallowed by its
 # neighbour.
-# What remains are the cases where a tier is set to zero, hence disabled in
-# practice.
+# What remains are the cases where a tier is set to zero: WEEKLY=0 disables
+# the weekly tier, MONTHLY=0 leaves the monthly one nothing older than the
+# weekly window.
 ANOMALIE=0
 if [ "$WEEKLY" -lt 1 ]; then
     ANOMALIE=1
@@ -209,7 +280,7 @@ if [ "$MONTHLY_UNIX" -ge "$((NOW_UNIX - WEEKLY_SEC))" ]; then
     ANOMALIE=1
     printf 'WARNING: MONTHLY=%s does not extend beyond the weekly window,\n' \
         "$MONTHLY"
-    printf '         the monthly tier is disabled.\n\n'
+    printf '         the monthly tier keeps nothing older than it.\n\n'
 fi
 
 # Decision for one archive, from its epoch, its day of the week and its day
@@ -336,10 +407,36 @@ printf '  deleted                : %s\n' "$del"
 printf '  ----------------------------------\n'
 printf '  kept in total          : %s\n\n' "$((kd + kw + km))"
 
-if [ "$kw" -eq 0 ] && [ "$ANOMALIE" -eq 1 ]; then
-    printf 'CONCLUSION: the father tier keeps nothing.\n'
-fi
-if [ "$ANOMALIE" -eq 0 ] && [ -z "$LISTFILE" ]; then
-    printf 'All three tiers are active, the configuration is consistent.\n'
+if [ -n "$LISTFILE" ]; then
+    # Replay: a recent machine keeps nothing in the upper tiers yet, which
+    # says nothing about its configuration. Only a weekly tier that the
+    # configuration disables is pointed out.
+    if [ "$kw" -eq 0 ] && [ "$ANOMALIE" -eq 1 ]; then
+        printf 'CONCLUSION: the father tier keeps nothing.\n'
+    fi
+else
+    # Simulation: the verdict rests on what each tier actually kept, and no
+    # longer on the configuration alone, which printed "consistent" with
+    # empty tiers (RC-01). The son tier always keeps the archive of the
+    # day, DAILY being at least 1. A tier that the simulated history does
+    # not reach is not blamed on the configuration.
+    if [ "$ANOMALIE" -eq 0 ] && [ "$kd" -gt 0 ] && [ "$kw" -gt 0 ] &&
+        [ "$km" -gt 0 ]; then
+        printf 'All three tiers are active, the configuration is consistent.\n'
+    fi
+    if [ "$kw" -eq 0 ]; then
+        printf 'CONCLUSION: the father tier keeps nothing.\n'
+        if [ "$DAYS" -le "$DAILY" ]; then
+            printf '  %s simulated days do not reach its window, see -D.\n' \
+                "$DAYS"
+        fi
+    fi
+    if [ "$km" -eq 0 ]; then
+        printf 'CONCLUSION: the grandfather tier keeps nothing.\n'
+        if [ "$DAYS" -le "$((WEEKLY_SEC / 86400))" ]; then
+            printf '  %s simulated days do not reach its window, see -D.\n' \
+                "$DAYS"
+        fi
+    fi
 fi
 exit 0
