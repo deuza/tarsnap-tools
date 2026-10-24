@@ -181,10 +181,26 @@ die() {
 # The function must return 0. Any other value stops the script BEFORE the
 # archive is created, hence before any deletion: better to back up nothing
 # than to back up a half-dumped database.
+#
+# set -e only stops the script on a command that fails on a line of its
+# own. A failure goes unnoticed in a pipeline, except in its last command
+# (dash has no pipefail), on the left of && or ||, and in the condition of
+# an if or a while: one command per line, and test what has to be tested.
+#
+# Both hooks run in a subshell, see run_hook(): a variable they set does
+# not reach the rest of the script.
 prebackup() {
     say "Taking inventory of installed packages."
     "$DPKG_BIN" --get-selections > "$PKG_SELECTIONS"
-    "$APT_BIN" list --installed 2>/dev/null > "$PKG_LIST"
+    # apt warns on stderr, at every call, that its interface is not stable:
+    # the message is captured, and only shown when apt fails. The failure
+    # does not stop the backup, the rest of the system being worth more
+    # than a list of packages, but it is reported with apt's own message.
+    if ! _apt_err=$("$APT_BIN" list --installed 2>&1 >"$PKG_LIST"); then
+        printf 'WARNING: apt list failed, incomplete list in %s:\n' \
+            "$PKG_LIST" >&2
+        printf '%s\n' "$_apt_err" >&2
+    fi
 
     # Examples to uncomment and adapt. Declare the absolute path of the
     # binary at the top of the script, like the others, rather than
@@ -217,6 +233,12 @@ prebackup() {
 # Same rules: it is also run in --dry-run, and it must return 0. A failure
 # here leaves the archive in place and skips the rotation, so the old
 # archives pile up. That is the desirable way to fail.
+#
+# It receives the exit status of tarsnap -c as $1: 0 on success, 2 when the
+# archive was created but some files could not be read, any other value
+# when the creation failed. It runs in every case, so that whatever
+# prebackup set up is undone; on a failed creation the script then stops
+# without touching the rotation.
 postbackup() {
     # say "Cleaning up the dumps."
     # rm -f /root/dumps/mysql-all.sql
@@ -225,6 +247,30 @@ postbackup() {
     # /usr/local/sbin/post-backup-hook.sh
 
     return 0
+}
+
+# Runs a hook, prebackup or postbackup, in a subshell. The hooks are the
+# user's code, which would otherwise inherit the internals of the script:
+#   - descriptor 9, which holds the lock: a daemon started by a hook would
+#     keep it open, and every following run would find the lock taken;
+#   - the variable named by an env: passphrase, which every program started
+#     by a hook would receive in its environment;
+#   - the -f option, which disables globbing: "rm -f /root/dumps/*.sql"
+#     would remove nothing.
+# set -e remains active in the subshell, and a failure in the hook stops
+# the script. The calls stay bare, never in a condition, see STEP 1.
+run_hook() {
+    (
+        exec 9>&-
+        case "$TARSNAP_PASSPHRASE" in
+            env:*) unset "${TARSNAP_PASSPHRASE#env:}" ;;
+        esac
+        set +f
+        case "$1" in
+            prebackup) prebackup ;;
+            postbackup) postbackup "$2" ;;
+        esac
+    )
 }
 
 # Print one family of archives, then the matching delete command. Nothing
@@ -489,6 +535,7 @@ main() {
 # the purge circuit breaker is a decision taken for one run, after review,
 # not a setting.
 FORCE_PURGE=0
+SNAPSHOT_GIVEN=0
 
 # POSIX getopts only knows single-character options: the long forms are
 # translated before running it, with one or two dashes accepted.
@@ -521,7 +568,7 @@ while getopts "dFhnovs:" option; do
         F) FORCE_PURGE=1 ;;
         h) usage 0 ;;
         o) ORPHANS=1 ;;
-        s) SNAPSHOT_NAME=$OPTARG ;;
+        s) SNAPSHOT_NAME=$OPTARG; SNAPSHOT_GIVEN=1 ;;
         v) VERBOSE=1 ;;
         *) usage 1 ;;
     esac
@@ -555,8 +602,17 @@ done
 # The snapshot name ends up in an archive name: anything that would
 # introduce a space or an exotic character is forbidden. An explicit list
 # rather than a range such as [A-Za-z], whose content depends on the locale.
+#
+# -s given an empty name would fall back to a normal backup, rotation
+# included. A name starting with "-" is most likely an option swallowed by
+# -s ("-s --dry-run"), which would then run for real.
+if [ "$SNAPSHOT_GIVEN" -eq 1 ] && [ -z "$SNAPSHOT_NAME" ]; then
+    die "empty snapshot name"
+fi
 case "$SNAPSHOT_NAME" in
     "") ;;
+    -*)
+        die "invalid snapshot name, it must not start with -" ;;
     *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-]*)
         die "invalid snapshot name, allowed characters: A-Z a-z 0-9 _ -" ;;
 esac
@@ -721,8 +777,10 @@ else
     # --quiet only hides a few warnings ("Removing leading '/'", etc.).
     # It is --no-print-stats that neutralises the print-stats directive of
     # tarsnap.conf, responsible for the "All archives / This archive /
-    # New data" block printed on stderr in modes c and d.
-    TARSNAP_MSGOPT="--quiet --no-print-stats"
+    # New data" block printed on stderr in modes c and d. --no-totals and
+    # --no-progress-bytes do the same for the totals and progress-bytes
+    # directives; the latter requires tarsnap 1.0.40 or later.
+    TARSNAP_MSGOPT="--quiet --no-print-stats --no-totals --no-progress-bytes"
 fi
 
 COMPUTER=$("$UNAME_BIN" -n)
@@ -750,6 +808,13 @@ fi
 # releases it when the process dies, including on kill -9, OOM or power
 # failure: no stale file to clean up by hand, and no possible race, unlike
 # an existence test followed by a touch.
+#
+# exec is a special built-in: under dash, when its redirection fails the
+# shell exits at once, before "|| die" can run, and the message is lost.
+# The opening is therefore tried first in a subshell.
+if ! (exec 9>"$LOCK_FILE") 2>/dev/null; then
+    die "cannot open the lock: $LOCK_FILE"
+fi
 exec 9>"$LOCK_FILE" || die "cannot open the lock: $LOCK_FILE"
 if ! "$FLOCK_BIN" -n 9; then
     die "another instance is already running (lock $LOCK_FILE)"
@@ -765,7 +830,8 @@ fi
 # still run, and the function would return 0. Behaviour verified to be
 # identical under dash and under bash. With the bare call, set -e stops
 # the script on the failing command, whose message goes into the cron mail.
-prebackup
+# run_hook() runs it in a subshell.
+run_hook prebackup
 
 NOW=$("$DATE_BIN" +%Y-%m-%d_%H-%M-%S)
 if [ -n "$SNAPSHOT_NAME" ]; then
@@ -828,13 +894,33 @@ else
     say "Creating archive ${NAME}."
 fi
 
+#
+# The exit status is kept rather than left to set -e: postbackup must run
+# whatever the outcome, and tarsnap -c exits with 2 when the archive was
+# created but some files could not be read (a file deleted during the
+# backup, a permission refused). The archive then exists: it is worth a
+# warning, neither a silent success nor an abort.
+CREATE_RC=0
 # shellcheck disable=SC2086
-"$TARSNAP_BIN" $TARSNAP_KEYOPT $TARSNAP_MSGOPT -c -f "$NAME" "$@" $BACKUP_DIRS
+"$TARSNAP_BIN" $TARSNAP_KEYOPT $TARSNAP_MSGOPT -c -f "$NAME" "$@" \
+    $BACKUP_DIRS || CREATE_RC=$?
 
 # Counterpart of prebackup, run whether this is a snapshot or a normal
 # backup: whatever prebackup set up must be undone in every case.
-# Bare call, for the same reason as above.
-postbackup
+# Bare call, for the same reason as above. It receives the exit status of
+# tarsnap -c.
+run_hook postbackup "$CREATE_RC"
+
+case "$CREATE_RC" in
+    0) ;;
+    2)
+        printf 'WARNING: tarsnap -c exited with status 2: some files\n' >&2
+        printf '  could not be read, see the messages above. This run\n' >&2
+        printf '  will exit with status 2.\n' >&2
+        ;;
+    *)
+        die "tarsnap -c failed (exit status $CREATE_RC), no rotation" ;;
+esac
 
 # A snapshot is a one-off action: chaining three of them before going into
 # production must not trigger three purges.
@@ -844,7 +930,7 @@ if [ -n "$SNAPSHOT_NAME" ]; then
     else
         say "Snapshot ${NAME} created, rotation skipped."
     fi
-    exit 0
+    exit "$CREATE_RC"
 fi
 
 ###############################################################################
@@ -894,6 +980,14 @@ ARCHIVES=$("$TARSNAP_BIN" $TARSNAP_KEYOPT --list-archives)
 # themselves under the C collation, whatever the locale of the run. The
 # purge list follows the same order.
 ARCHIVES=$(printf '%s\n' "$ARCHIVES" | LC_ALL=C "$SORT_BIN")
+
+# After an exit status 2, nothing is deleted unless the archive of the run
+# is listed: a status 2 does not prove by itself that it was written. In
+# --dry-run nothing was created, and nothing will be deleted either.
+if [ "$CREATE_RC" -eq 2 ] && [ "$DRY" -eq 0 ] &&
+    ! printf '%s\n' "$ARCHIVES" | "$GREP_BIN" -Fqx -- "$NAME"; then
+    die "archive $NAME not listed after an exit status 2, no rotation"
+fi
 
 # Start again from an empty set of positional parameters: it will serve as
 # the accumulator of the "-f archive" pairs to delete.
@@ -1063,7 +1157,7 @@ COUNT=$(($# / 2))
 
 if [ "$COUNT" -eq 0 ]; then
     say "Nothing to purge."
-    exit 0
+    exit "$CREATE_RC"
 fi
 
 say "$COUNT archive(s) to delete."
@@ -1078,7 +1172,7 @@ if [ "$DRY" -eq 1 ]; then
         printf '  a real run would stop here and delete nothing,\n' >&2
         printf '  unless given --force-purge\n' >&2
     fi
-    exit 0
+    exit "$CREATE_RC"
 fi
 
 # Purge circuit breaker, see MAX_PURGE. Only the real purge is stopped:
@@ -1106,7 +1200,7 @@ fi
 "$TARSNAP_BIN" $TARSNAP_KEYOPT $TARSNAP_MSGOPT -d "$@"
 
 say "Done."
-exit 0
+exit "$CREATE_RC"
 
 # End of main(), opened above the option parsing.
 }
