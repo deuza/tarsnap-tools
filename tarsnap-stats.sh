@@ -47,6 +47,18 @@
 # abort anyway. Note that each of those two calls loads the key file
 # independently, so a passphrase-protected key is prompted for twice.
 #
+# Passphrase method: -p METHOD is passed to every tarsnap call as
+# "--passphrase METHOD" (tarsnap 1.0.40 or later), so that a protected key
+# can be unlocked without typing the passphrase twice: env:VAR reads it from
+# an environment variable, file:PATH from a file, and dev:tty-stdin or
+# dev:tty-once keep the prompt. A "passphrase" line in tarsnap.conf does the
+# same job; -p wins over it, since options given on the command line are
+# processed before the configuration files. dev:stdin-once is refused: the
+# key is loaded twice, and the second call would find stdin already read.
+# Any other value is refused before tarsnap runs, and never repeated in the
+# message: tarsnap 1.0.41 copies an unparsable method to stderr, which would
+# print the passphrase itself if it was given instead of a method.
+#
 # Progress is reported on stderr only, and only when stderr is a terminal:
 # stdout stays clean so the output can be piped or redirected as-is. While the
 # archive list is being fetched, the live count and the name of the last
@@ -91,16 +103,24 @@ export LC_ALL
 # one single command name.
 TARSNAP=${TARSNAP:-tarsnap}
 KEYFILE=${TARSNAP_KEYFILE:-}      # empty: let tarsnap.conf decide
+# Passphrase method given with -p; empty: let tarsnap.conf decide. No
+# environment variable on purpose: a variable named after the passphrase
+# invites exporting the passphrase itself, which would end up in argv.
+PASSPHRASE=''
+popt=0
 TSOPT='--no-aggressive-networking'
 # 1000 = SI prefixes (default, matches tarsnap), 1024 = binary prefixes.
 BASE=1000
 
 usage() {
     cat <<EOF
-usage: $0 [-b] [-k keyfile]
+usage: $0 [-b] [-k keyfile] [-p method]
   -b           use binary prefixes (KiB/MiB/GiB) instead of SI ones
   -k keyfile   key file of this machine, when it is not where tarsnap.conf
                says it is (default there is usually /root/tarsnap.key)
+  -p method    how tarsnap reads the passphrase of a protected key file:
+               env:VAR, file:PATH, dev:tty-stdin or dev:tty-once
+               (tarsnap 1.0.40 or later)
 EOF
 }
 
@@ -114,10 +134,11 @@ esac
 # The leading ':' selects getopts' silent mode: the shell keeps its own
 # "Illegal option" message to itself and we report the problem ourselves, so
 # the wording is the same whichever shell runs the script.
-while getopts ':bk:h' opt; do
+while getopts ':bk:p:h' opt; do
     case "$opt" in
         b) BASE=1024 ;;
         k) KEYFILE=$OPTARG ;;
+        p) PASSPHRASE=$OPTARG; popt=1 ;;
         h) usage; exit 0 ;;
         :) printf '%s: option -%s requires an argument\n' "$0" "$OPTARG" >&2
            usage >&2; exit 2 ;;
@@ -134,6 +155,25 @@ if [ "$#" -gt 0 ]; then
     printf '%s: unexpected argument: %s\n' "$0" "$1" >&2
     usage >&2
     exit 2
+fi
+
+# The -p value is checked against the methods tarsnap knows, before any
+# tarsnap call. The messages below never print the value: see the header.
+if [ "$popt" -eq 1 ]; then
+    case "$PASSPHRASE" in
+        dev:tty-stdin|dev:tty-once|env:?*|file:?*) ;;
+        dev:stdin-once)
+            printf '%s: -p dev:stdin-once cannot work here: the key file is\n' \
+                "$0" >&2
+            printf '  loaded twice, and the second call would find stdin empty\n' >&2
+            usage >&2
+            exit 2 ;;
+        *)
+            printf '%s: -p: not a passphrase method (value not shown)\n' \
+                "$0" >&2
+            usage >&2
+            exit 2 ;;
+    esac
 fi
 
 # "tarsnap --verify-config" validates the configuration syntax, it does not
@@ -160,6 +200,11 @@ fi
 set -- "$TSOPT" --no-humanize-numbers
 if [ -n "$KEYFILE" ]; then
     set -- "$@" --keyfile "$KEYFILE"
+fi
+# The method is one argv element, whatever it holds: a path with blanks in
+# file:PATH reaches tarsnap intact.
+if [ "$popt" -eq 1 ]; then
+    set -- "$@" --passphrase "$PASSPHRASE"
 fi
 
 # --- Temporary file and cleanup ---------------------------------------------
