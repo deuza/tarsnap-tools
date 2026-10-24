@@ -391,6 +391,60 @@ conf_keyfile() {
     printf '%s\n' "$_ck_key"
 }
 
+# Retention values. Each one must be a decimal integer written without a
+# leading zero: the arithmetic of dash and bash reads "030" as octal, so
+# DAILY=030 silently kept 24 days of daily archives instead of 30 and
+# WEEKLY=012 ten weeks, while "090" stopped the script with a message that
+# depends on the shell. A negative value, a word ("Mon"), a comment glued
+# to the value ("1#Monday") or the CR of a configuration saved with DOS
+# line endings ended in a silent over-purge, or in a purge that went on
+# through a flood of error messages. An explicit list of digits rather
+# than a range such as [0-9], whose content depends on the locale.
+#
+# Five digits at most, checked on the text before any comparison: with
+# twenty digits, [ -lt ] and [ -gt ] fail ("Illegal number" under dash,
+# "integer expression expected" under bash), the if turns false, and the
+# value went through to an arithmetic that wraps around. Five digits keep
+# the worst case, 99999 days plus 99999 weeks in seconds, at 69119308800,
+# far from the 9223372036854775807 of 64-bit arithmetic, and date -d still
+# takes 99999 months. No tighter bound per variable: a larger value only
+# ever keeps more archives, never fewer, and DAILY=99999 remains a simple
+# way to suspend the purge.
+#
+# Then the ranges: DAILY of at least 1, so that the archive this very run
+# creates never falls outside the daily window and into its own purge; DOW
+# from 0 (Sunday) to 6 (Saturday), as date +%w counts, so that the 7 that
+# cron accepts for Sunday is refused rather than never matching; DOM from
+# 1 to 31. WEEKLY or MONTHLY at 0 disables its tier, as documented. The
+# messages name the variable but never echo its raw value. To be kept
+# identical, byte for byte, to the function of the same name in
+# rotation-check.sh.
+check_retention() {
+    set -- DAILY "$DAILY" WEEKLY "$WEEKLY" MONTHLY "$MONTHLY" \
+        DOW "$DOW" DOM "$DOM"
+    while [ "$#" -ge 2 ]; do
+        case "$2" in
+            ""|*[!0123456789]*|0?*)
+                die "$1 must be a decimal integer, without a leading zero"
+                ;;
+            ??????*)
+                die "$1 must have at most 5 digits"
+                ;;
+        esac
+        shift 2
+    done
+    if [ "$DAILY" -lt 1 ]; then
+        die "DAILY must be at least 1"
+    fi
+    if [ "$DOW" -gt 6 ]; then
+        die "DOW must be between 0 (Sunday) and 6 (Saturday)"
+    fi
+    if [ "$DOM" -lt 1 ] || [ "$DOM" -gt 31 ]; then
+        die "DOM must be between 1 and 31"
+    fi
+    return 0
+}
+
 # POSIX getopts only knows single-character options: the long forms are
 # translated before running it, with one or two dashes accepted.
 for arg do
@@ -443,6 +497,12 @@ case "$SNAPSHOT_NAME" in
     *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-]*)
         die "invalid snapshot name, allowed characters: A-Z a-z 0-9 _ -" ;;
 esac
+
+# Retention values, see check_retention(). Checked in every mode, like the
+# other safeguards: a broken value is reported by the next run of any
+# kind, a snapshot or --orphans included, rather than discovered through
+# a purge.
+check_retention
 
 # TARSNAP_KEY and TARSNAP_PASSPHRASE end up in TARSNAP_KEYOPT, expanded
 # unquoted so that the options vanish when empty (see below): a blank
