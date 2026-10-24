@@ -103,6 +103,18 @@ MONTHLY=48  # then, over the next N months, those falling on a $DOM
 DOW=1       # day of the week kept (0 = Sunday, 1 = Monday)
 DOM=1       # day of the month kept
 
+# --- Purge circuit breaker ---
+# Most archives a single run may delete. Past it, the run deletes nothing,
+# keeps the archive it has just created, and stops with an error, hence a
+# cron mail: review with --dry-run --verbose, then rerun once with
+# --force-purge. In steady state a run deletes 0 or 1 archive, and a clock
+# moved forward makes the purge delete about one archive per day of shift:
+# 7 lets a week of missed nights through, and stops a clock that jumped
+# more than about a week ahead, retention values cut by mistake, or a
+# reinstalled script whose retention went back to the defaults.
+# Decimal integer from 1 to 99999, without a leading zero.
+MAX_PURGE=7
+
 ###############################################################################
 # END OF CONFIGURATION
 ###############################################################################
@@ -112,15 +124,18 @@ DOM=1       # day of the month kept
 # Exit code as argument: 0 for --help, 1 for an invalid option.
 usage() {
     cat >&2 <<EOF
-usage: ${0##*/} [-d|-n|--dry-run] [-v|--verbose] [-h|--help]
+usage: ${0##*/} [-d|-n|--dry-run] [-v|--verbose] [-F|--force-purge]
        ${0##*/} [-s|--snapshot-name] NAME
        ${0##*/} [-o|--orphans]
+       ${0##*/} [-h|--help]
 
   -d, -n, --dry-run      full simulation: nothing is created or deleted,
                          only the purge command is printed. The creation
                          is simulated by tarsnap --dry-run, which reads the
                          files, so it takes as long as a real run.
   -v, --verbose          detail the decision made for each archive
+  -F, --force-purge      lift MAX_PURGE for this run only, once the purge
+                         has been reviewed with --dry-run --verbose
   -s, --snapshot-name N  create an archive suffixed with N, then exit
                          without rotating. Its name makes it permanently
                          untouchable by the purge. Also accepts
@@ -445,6 +460,11 @@ check_retention() {
     return 0
 }
 
+# Set by -F or --force-purge, never in the configuration block: lifting
+# the purge circuit breaker is a decision taken for one run, after review,
+# not a setting.
+FORCE_PURGE=0
+
 # POSIX getopts only knows single-character options: the long forms are
 # translated before running it, with one or two dashes accepted.
 for arg do
@@ -461,6 +481,8 @@ for arg do
         --snapshot-name|-snapshot-name)
                             set -- "$@" -s ;;
         --orphans|-orphans) set -- "$@" -o ;;
+        --force-purge|-force-purge)
+                            set -- "$@" -F ;;
         *)                  set -- "$@" "$arg" ;;
     esac
 done
@@ -468,9 +490,10 @@ done
 # Beware: the -d of the script means "delete nothing", the exact opposite
 # of the -d of tarsnap, which does delete. -n is accepted as a synonym, it
 # is the less ambiguous of the two forms.
-while getopts "dhnovs:" option; do
+while getopts "dFhnovs:" option; do
     case "$option" in
         d|n) DRY=1 ;;
+        F) FORCE_PURGE=1 ;;
         h) usage 0 ;;
         o) ORPHANS=1 ;;
         s) SNAPSHOT_NAME=$OPTARG ;;
@@ -503,6 +526,16 @@ esac
 # kind, a snapshot or --orphans included, rather than discovered through
 # a purge.
 check_retention
+
+# MAX_PURGE follows the rules of the retention values, from 1 to 99999: a
+# decimal integer without a leading zero, five digits at most, checked on
+# the text. 0 would stop every purge, which is the job of --dry-run, not
+# of a breaker; 99999 practically disables it.
+case "$MAX_PURGE" in
+    ""|*[!0123456789]*|0*|??????*)
+        die "MAX_PURGE must be a decimal integer from 1 to 99999," \
+            "without a leading zero" ;;
+esac
 
 # TARSNAP_KEY and TARSNAP_PASSPHRASE end up in TARSNAP_KEYOPT, expanded
 # unquoted so that the options vanish when empty (see below): a blank
@@ -881,7 +914,32 @@ if [ "$DRY" -eq 1 ]; then
     printf 'Dry-run, command that would be executed:\n'
     printf '%s %s %s -d %s\n' \
         "$TARSNAP_BIN" "$TARSNAP_KEYOPT" "$TARSNAP_MSGOPT" "$*"
+    if [ "$COUNT" -gt "$MAX_PURGE" ]; then
+        printf 'WARNING: %s archives to delete, more than MAX_PURGE=%s:\n' \
+            "$COUNT" "$MAX_PURGE" >&2
+        printf '  a real run would stop here and delete nothing,\n' >&2
+        printf '  unless given --force-purge\n' >&2
+    fi
     exit 0
+fi
+
+# Purge circuit breaker, see MAX_PURGE. Only the real purge is stopped:
+# the dry-run above prints the command and warns, since it is precisely
+# the review that the message below asks for. Nothing is deleted, not even
+# the first MAX_PURGE archives: whatever made the purge this large, a clock
+# ahead, retention values changed by mistake or reset by a reinstalled
+# script, makes its whole list untrustworthy. The archive of this run
+# exists already, and postbackup has run.
+if [ "$COUNT" -gt "$MAX_PURGE" ]; then
+    if [ "$FORCE_PURGE" -eq 0 ]; then
+        printf 'ERROR: %s archives to delete, more than MAX_PURGE=%s:\n' \
+            "$COUNT" "$MAX_PURGE" >&2
+        printf '  nothing was deleted: check the clock and the retention\n' >&2
+        printf '  values, review with --dry-run --verbose, then rerun\n' >&2
+        printf '  once with --force-purge\n' >&2
+        exit 1
+    fi
+    say "MAX_PURGE=$MAX_PURGE lifted by --force-purge for this run."
 fi
 
 # A single call: the man page allows -f to be repeated in -d mode, and
