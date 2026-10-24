@@ -392,7 +392,6 @@ fi
 dbg "BACKUP_SCRIPT=$BACKUP_SCRIPT"
 dbg "BACKUP_DIRS=$BACKUP_DIRS"
 dbg "BACKUP_EXCLUDE=$BACKUP_EXCLUDE"
-dbg "TARSNAP_PASSPHRASE=$TARSNAP_PASSPHRASE"
 
 ###############################################################################
 # SAFEGUARDS
@@ -482,10 +481,13 @@ case "$TARSNAP_KEY" in
         die "TARSNAP_KEY must not contain whitespace, see $BACKUP_SCRIPT:" \
             "$TARSNAP_KEY" ;;
 esac
+# The messages below do not repeat the value of TARSNAP_PASSPHRASE: a value
+# that fails these checks may be the passphrase itself, written there by
+# mistake, and it would end up in the cron mail.
 case "$TARSNAP_PASSPHRASE" in
     *[[:space:]]*)
         die "TARSNAP_PASSPHRASE must not contain whitespace, see" \
-            "$BACKUP_SCRIPT: $TARSNAP_PASSPHRASE" ;;
+            "$BACKUP_SCRIPT (value not shown)" ;;
 esac
 
 # The passphrase method must be one that tarsnap understands, otherwise it
@@ -497,14 +499,18 @@ esac
 case "$TARSNAP_PASSPHRASE" in
     ""|dev:tty-stdin|dev:tty-once|dev:stdin-once|env:[!0-9]*|file:?*) ;;
     *)
-        die "invalid TARSNAP_PASSPHRASE, see $BACKUP_SCRIPT:" \
-            "$TARSNAP_PASSPHRASE" ;;
+        die "invalid TARSNAP_PASSPHRASE, see $BACKUP_SCRIPT" \
+            "(value not shown)" ;;
 esac
 case "$TARSNAP_PASSPHRASE" in
     env:*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_]*)
         die "invalid variable name in TARSNAP_PASSPHRASE, see" \
-            "$BACKUP_SCRIPT: $TARSNAP_PASSPHRASE" ;;
+            "$BACKUP_SCRIPT (value not shown)" ;;
 esac
+
+# Shown only now, once its syntax has been checked: before that, it could
+# be the passphrase itself, written there by mistake.
+dbg "TARSNAP_PASSPHRASE=$TARSNAP_PASSPHRASE"
 
 if [ -n "$TARSNAP_KEY" ] && [ ! -r "$TARSNAP_KEY" ]; then
     die "tarsnap key not readable: $TARSNAP_KEY"
@@ -583,9 +589,12 @@ passphrase_reachable() {
             _pp_name=${TARSNAP_PASSPHRASE#env:}
             PASSPHRASE_HOW="read from the environment variable $_pp_name"
             PASSPHRASE_WHY="environment variable $_pp_name unset or empty"
-            _pp_value=""
-            eval "_pp_value=\${$_pp_name-}"
-            [ -n "$_pp_value" ]
+            # ${NAME:+x} rather than the value itself: under set -x, the
+            # --debug of tarsnap-diff.sh, the trace shows x, and not the
+            # passphrase.
+            _pp_set=""
+            eval "_pp_set=\${$_pp_name:+x}"
+            [ -n "$_pp_set" ]
             ;;
         file:*)
             _pp_file=${TARSNAP_PASSPHRASE#file:}
@@ -594,8 +603,14 @@ passphrase_reachable() {
             PASSPHRASE_WHY="$PASSPHRASE_WHY empty or not a single line"
             [ -r "$_pp_file" ] || return 1
             [ -f "$_pp_file" ] || return 0
+            # tarsnap ends the passphrase at the first CR or LF: a single
+            # line that is empty, or starts with a CR, gives an empty
+            # passphrase. sed answers y or nothing: the passphrase itself
+            # never reaches the shell, nor its trace.
+            _pp_sed='1{/^\r/d;/^$/d;s/.*/y/p;}'
             [ -s "$_pp_file" ] &&
-                [ "$("$SED_BIN" -n '$=' "$_pp_file")" = 1 ]
+                [ "$("$SED_BIN" -n '$=' "$_pp_file")" = 1 ] &&
+                [ "$("$SED_BIN" -n "$_pp_sed" "$_pp_file")" = y ]
             ;;
     esac
 }

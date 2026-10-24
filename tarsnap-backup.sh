@@ -28,6 +28,10 @@
 
 set -euf
 
+# Files created by the script and by its hooks are private to root: the
+# lock (see LOCK_FILE), the package inventories, the dumps of prebackup.
+umask 077
+
 #################
 # CONFIGURATION #
 #################
@@ -48,6 +52,7 @@ SORT_BIN="/usr/bin/sort"
 DPKG_BIN="/usr/bin/dpkg"
 APT_BIN="/usr/bin/apt"
 FLOCK_BIN="/usr/bin/flock"
+CHMOD_BIN="/usr/bin/chmod"
 
 # --- Default behaviour, can be overridden by the options ---
 DRY=0            # 1 = full simulation, no archive is created or deleted
@@ -91,8 +96,11 @@ BACKUP_DIRS="/root /boot /etc"
 BACKUP_EXCLUDE="*/tmp/* /var/www/html/APOD"
 
 # Run lock. In /run, and neither in /tmp nor in /run/lock, which are mode
-# 1777: any local user could hold the lock there and block the backups.
-# /run is mode 755, owned by root.
+# 1777: any local user could create the file there first. /run is mode
+# 755, owned by root, which only protects the creation and the replacement
+# of the file. The file itself is created in mode 0600 (umask 077): flock(2)
+# also locks a descriptor opened read-only, so that a lock readable by all
+# could be held by any local user, and block the backups.
 LOCK_FILE="/run/tarsnap-backup.lock"
 
 # Package inventory, regenerated before each backup
@@ -290,19 +298,41 @@ orphans_section() {
         printf '  (none)\n\n'
         return 0
     fi
-    for _a in $_list; do
-        printf '  %s\n' "$_a"
-    done
-    printf '\n  Delete command, review before pasting:\n'
-    if [ -n "$TARSNAP_KEYOPT" ]; then
-        printf '  %s %s -d' "$TARSNAP_BIN" "$TARSNAP_KEYOPT"
-    else
-        printf '  %s -d' "$TARSNAP_BIN"
+    # One name per line in $_list, read whole. Each name is shown with its
+    # control characters neutralised, and only the names that can be
+    # pasted without quotes go into the command.
+    _safe=""
+    _unsafe=0
+    while IFS= read -r _a; do
+        [ -n "$_a" ] || continue
+        printf '  %s\n' "$(shown "$_a")"
+        if is_safe_name "$_a"; then
+            _safe="${_safe} ${_a}"
+        else
+            _unsafe=$((_unsafe + 1))
+        fi
+    done <<_END_OF_SECTION_
+$_list
+_END_OF_SECTION_
+    if [ -n "$_safe" ]; then
+        printf '\n  Delete command, review before pasting:\n'
+        if [ -n "$TARSNAP_KEYOPT" ]; then
+            printf '  %s %s -d' "$TARSNAP_BIN" "$TARSNAP_KEYOPT"
+        else
+            printf '  %s -d' "$TARSNAP_BIN"
+        fi
+        for _a in $_safe; do
+            printf -- ' -f %s' "$_a"
+        done
+        printf '\n'
     fi
-    for _a in $_list; do
-        printf -- ' -f %s' "$_a"
-    done
-    printf '\n\n'
+    if [ "$_unsafe" -gt 0 ]; then
+        printf '\n  Left out of the command: %s name(s) holding characters\n' \
+            "$_unsafe"
+        printf '  that a shell would interpret, shown above with ? for the\n'
+        printf '  unprintable ones. Delete them by hand, name quoted.\n'
+    fi
+    printf '\n'
     return 0
 }
 
@@ -326,19 +356,26 @@ list_orphans() {
     # shellcheck disable=SC2086
     _all=$("$TARSNAP_BIN" $TARSNAP_KEYOPT --list-archives)
 
+    # One archive per line, read whole, and lists of one name per line: a
+    # name holding a space stays one name.
+    _nl='
+'
     _orphans=""
     _parts=""
-    for _a in $_all; do
+    while IFS= read -r _a; do
+        [ -n "$_a" ] || continue
         # shellcheck disable=SC2254
         case "$_a" in
             *.part)
-                _parts="${_parts} ${_a}" ;;
+                _parts="${_parts}${_a}${_nl}" ;;
             "${COMPUTER}-"$STAMP_GLOB)
                 ;;
             *)
-                _orphans="${_orphans} ${_a}" ;;
+                _orphans="${_orphans}${_a}${_nl}" ;;
         esac
-    done
+    done <<_END_OF_ARCHIVE_LIST_
+$_all
+_END_OF_ARCHIVE_LIST_
 
     printf 'Archives beyond the reach of the rotation, hostname "%s".\n\n' "$COMPUTER"
     orphans_section "Orphans: name outside the pattern, never purged" "$_orphans"
@@ -419,9 +456,12 @@ passphrase_reachable() {
             _pp_name=${TARSNAP_PASSPHRASE#env:}
             PASSPHRASE_HOW="read from the environment variable $_pp_name"
             PASSPHRASE_WHY="environment variable $_pp_name unset or empty"
-            _pp_value=""
-            eval "_pp_value=\${$_pp_name-}"
-            [ -n "$_pp_value" ]
+            # ${NAME:+x} rather than the value itself: under set -x, the
+            # --debug of tarsnap-diff.sh, the trace shows x, and not the
+            # passphrase.
+            _pp_set=""
+            eval "_pp_set=\${$_pp_name:+x}"
+            [ -n "$_pp_set" ]
             ;;
         file:*)
             _pp_file=${TARSNAP_PASSPHRASE#file:}
@@ -430,8 +470,14 @@ passphrase_reachable() {
             PASSPHRASE_WHY="$PASSPHRASE_WHY empty or not a single line"
             [ -r "$_pp_file" ] || return 1
             [ -f "$_pp_file" ] || return 0
+            # tarsnap ends the passphrase at the first CR or LF: a single
+            # line that is empty, or starts with a CR, gives an empty
+            # passphrase. sed answers y or nothing: the passphrase itself
+            # never reaches the shell, nor its trace.
+            _pp_sed='1{/^\r/d;/^$/d;s/.*/y/p;}'
             [ -s "$_pp_file" ] &&
-                [ "$("$SED_BIN" -n '$=' "$_pp_file")" = 1 ]
+                [ "$("$SED_BIN" -n '$=' "$_pp_file")" = 1 ] &&
+                [ "$("$SED_BIN" -n "$_pp_sed" "$_pp_file")" = y ]
             ;;
     esac
 }
@@ -572,6 +618,25 @@ check_excludes() {
     BACKUP_EXCLUDE=$_excl
 }
 
+# Prints an archive name with every byte outside printable ASCII replaced
+# by "?": a name holding ESC or CR would otherwise drive the terminal of
+# root, or garble the cron mail.
+shown() {
+    printf '%s\n' "$1" | LC_ALL=C "$SED_BIN" 's/[^ -~]/?/g'
+}
+
+# Returns 0 when $1 only holds characters that a shell takes literally,
+# so that the name can be pasted without quotes. An explicit list rather
+# than ranges, whose content depends on the locale.
+is_safe_name() {
+    _ok=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-
+    # shellcheck disable=SC2254
+    case "$1" in
+        ""|*[!$_ok]*) return 1 ;;
+    esac
+    return 0
+}
+
 ###############################################################################
 # MAIN
 ###############################################################################
@@ -656,7 +721,7 @@ fi
 # All the configured binaries must be executable.
 for bin in "$TARSNAP_BIN" "$DATE_BIN" "$UNAME_BIN" "$LOCALE_BIN" \
            "$GREP_BIN" "$SED_BIN" "$SORT_BIN" "$DPKG_BIN" "$APT_BIN" \
-           "$FLOCK_BIN"; do
+           "$FLOCK_BIN" "$CHMOD_BIN"; do
     [ -x "$bin" ] || die "binary missing or not executable: $bin"
 done
 
@@ -707,10 +772,13 @@ case "$TARSNAP_KEY" in
     *[[:space:]]*)
         die "TARSNAP_KEY must not contain whitespace: $TARSNAP_KEY" ;;
 esac
+# The messages below do not repeat the value of TARSNAP_PASSPHRASE: a value
+# that fails these checks may be the passphrase itself, written there by
+# mistake, and it would end up in the cron mail.
 case "$TARSNAP_PASSPHRASE" in
     *[[:space:]]*)
-        die "TARSNAP_PASSPHRASE must not contain whitespace:" \
-            "$TARSNAP_PASSPHRASE" ;;
+        die "TARSNAP_PASSPHRASE must not contain whitespace" \
+            "(value not shown)" ;;
 esac
 
 # The passphrase method must be one that tarsnap understands, otherwise it
@@ -721,13 +789,13 @@ esac
 case "$TARSNAP_PASSPHRASE" in
     ""|dev:tty-stdin|dev:tty-once|dev:stdin-once|env:[!0-9]*|file:?*) ;;
     *)
-        die "invalid TARSNAP_PASSPHRASE, see the configuration block:" \
-            "$TARSNAP_PASSPHRASE" ;;
+        die "invalid TARSNAP_PASSPHRASE, see the configuration block" \
+            "(value not shown)" ;;
 esac
 case "$TARSNAP_PASSPHRASE" in
     env:*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_]*)
-        die "invalid variable name in TARSNAP_PASSPHRASE:" \
-            "$TARSNAP_PASSPHRASE" ;;
+        die "invalid variable name in TARSNAP_PASSPHRASE" \
+            "(value not shown)" ;;
 esac
 
 # The key must be readable, unless tarsnap.conf is relied upon.
@@ -887,6 +955,11 @@ exec 9>"$LOCK_FILE" || die "cannot open the lock: $LOCK_FILE"
 if ! "$FLOCK_BIN" -n 9; then
     die "another instance is already running (lock $LOCK_FILE)"
 fi
+# A lock left in mode 0644 by an earlier version is brought back to 0600,
+# once it is held. This does not revoke a descriptor that another user
+# would already have opened on it: in that case, reboot (/run is a tmpfs),
+# or delete the file while no backup is running.
+"$CHMOD_BIN" 600 "$LOCK_FILE"
 
 ###############################################################################
 # STEP 1: BACKUP
@@ -1110,14 +1183,14 @@ while IFS= read -r archive; do
             # or -d. It counts for deduplication and may
             # be of value: it is not deleted, a warning is issued instead.
             # The message goes to stderr, hence into the cron mail.
-            printf 'WARNING: partial archive: %s\n' "$archive" >&2
+            printf 'WARNING: partial archive: %s\n' "$(shown "$archive")" >&2
             printf '  leftover of an interrupted run, to be handled by hand\n' >&2
             continue
             ;;
         "${COMPUTER}-"$STAMP_GLOB)
             ;;
         *)
-            say "Outside the pattern, untouchable: $archive"
+            say "Outside the pattern, untouchable: $(shown "$archive")"
             continue
             ;;
     esac
