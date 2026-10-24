@@ -143,7 +143,15 @@ fi
 # "tarsnap --keyfile /path" would be looked up as one single command name.
 # Verified against tarsnap 1.0.41: --keyfile is accepted by --verify-config,
 # --list-archives and --print-stats alike.
-set -- "$TSOPT"
+# --no-humanize-numbers: the formatting below needs raw byte counts. With
+# "humanize-numbers" in a configuration file, --print-stats would print
+# "617 GB" instead of 617201465344, awk would read the mantissa and the unit
+# as the two numbers, and every size, ratio and cost would come out wrong
+# with an exit status of 0. Options given on the command line are processed
+# before the configuration files, and a configuration option already set is
+# then ignored without a word (tar/bsdtar.c in 1.0.41), so this one always
+# wins. Available since tarsnap 1.0.25.
+set -- "$TSOPT" --no-humanize-numbers
 if [ -n "$KEYFILE" ]; then
     set -- "$@" --keyfile "$KEYFILE"
 fi
@@ -345,6 +353,16 @@ END {
     if (!got_all || !got_uniq) {
         print "unrecognised --print-stats output: no \"All archives\"" \
             " and/or \"(unique data)\" row found" > "/dev/stderr"
+        exit 1
+    }
+    # The four figures must be plain byte counts. --no-humanize-numbers is
+    # passed above, but a tarsnap that ignored it, or a future change of the
+    # table, would otherwise be turned into wrong figures without an error:
+    # awk reads "3.0" as 3 and "MB" as 0.
+    if (all_total !~ /^[0-9]+$/ || all_comp !~ /^[0-9]+$/ ||
+        uniq_total !~ /^[0-9]+$/ || uniq_comp !~ /^[0-9]+$/) {
+        print "unrecognised --print-stats output: the sizes are not" \
+            " plain byte counts" > "/dev/stderr"
         exit 1
     }
 
