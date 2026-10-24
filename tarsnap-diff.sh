@@ -903,13 +903,22 @@ cleanup() {
         SPINNER_PID=""
         # Erasing with a fixed-width field: no ANSI sequence, so this also
         # holds up on a dumb terminal.
-        printf '\r%78s\r' '' >&2
+        # "|| true" on every write of this function: after a HUP the
+        # terminal is gone, and under set -e a write that fails here
+        # would end the cleanup halfway, with the exit status of printf
+        # instead of 128 + the signal (N-R1-18).
+        printf '\r%78s\r' '' >&2 || true
     fi
+    # A temporary directory that cannot be removed, a file marked immutable
+    # for instance, gives a warning instead of stopping the cleanup
+    # (N-R1-17).
     if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
         if [ "$DEBUG" -eq 1 ]; then
-            printf 'DEBUG: temporary directory kept: %s\n' "$TMP_DIR" >&2
+            printf 'DEBUG: temporary directory kept: %s\n' "$TMP_DIR" >&2 || true
         else
-            "$RM_BIN" -rf "$TMP_DIR"
+            "$RM_BIN" -rf "$TMP_DIR" ||
+                printf 'WARNING: could not remove the temporary directory: %s\n' \
+                    "$TMP_DIR" >&2 || true
         fi
     fi
     # The working files of the log only make sense until the final rename,
@@ -919,13 +928,15 @@ cleanup() {
     # look like a second, truncated log. --debug keeps the details file, as
     # it keeps the temporary directory.
     if [ -n "$LOGFILE_TMP" ] && [ -f "$LOGFILE_TMP" ]; then
-        "$RM_BIN" -f "$LOGFILE_TMP"
+        "$RM_BIN" -f "$LOGFILE_TMP" ||
+            printf 'WARNING: could not remove %s\n' "$LOGFILE_TMP" >&2 || true
     fi
     if [ -n "$LOGFILE_WORK" ] && [ -f "$LOGFILE_WORK" ]; then
         if [ "$DEBUG" -eq 1 ]; then
-            printf 'DEBUG: details of the log kept: %s\n' "$LOGFILE_WORK" >&2
+            printf 'DEBUG: details of the log kept: %s\n' "$LOGFILE_WORK" >&2 || true
         else
-            "$RM_BIN" -f "$LOGFILE_WORK"
+            "$RM_BIN" -f "$LOGFILE_WORK" ||
+                printf 'WARNING: could not remove %s\n' "$LOGFILE_WORK" >&2 || true
         fi
     fi
     return 0
@@ -936,10 +947,13 @@ cleanup() {
 # clean up and then let the script carry on with a temporary directory
 # that has just been erased, and what follows would derail in cascade on
 # "Directory nonexistent" errors. Exit codes 128 + signal number, as a
-# shell does.
+# shell does. QUIT, Ctrl-\ on a terminal, needs its own handler too: a
+# non-interactive shell keeps its default action, which ends the script
+# without going through the EXIT trap, hence without any cleanup (N-R1-18).
 trap 'cleanup' EXIT
 trap 'cleanup; exit 129' HUP
 trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 131' QUIT
 trap 'cleanup; exit 143' TERM
 
 # mktemp without a template creates $TMPDIR/tmp.XXXXXXXXXX, i.e.
@@ -989,6 +1003,21 @@ PATTERNS="$TMP_DIR/patterns"
 TAB=$(printf '\t')
 SOH=$(printf '\001')
 
+# The control bytes of a name, ESC, CR or BS for instance, would drive the
+# terminal of whoever reads the log with cat or less -R, or reads the
+# warnings: they are written as "?", under LC_ALL=C so that only the bytes
+# 0x01 to 0x1f and 0x7f are touched, whatever the locale (N-R3-4).
+# Newlines and tabs never get this far, those names stay out of the
+# inventories. Only a line that holds such a byte pays for the sed.
+ctl_safe() {
+    case "$1" in
+        *[[:cntrl:]]*)
+            printf '%s\n' "$1" | LC_ALL=C "$SED_BIN" 's/[[:cntrl:]]/?/g' ;;
+        *)
+            printf '%s\n' "$1" ;;
+    esac
+}
+
 # Spinner, taken from tarsnap-stats.sh. Two modes: "count" displays the
 # number of lines already received in the watched file, "plain" merely
 # spins. In count mode, strictly nothing is drawn as long as the watched
@@ -1014,6 +1043,11 @@ spin_start() {
     {
         while :; do
             for frame in '|' '/' '-' "\\"; do
+                # $$ is still the PID of the script in this subshell. If
+                # the script dies without going through its traps, kill -9
+                # for instance, the spinner sees it within a frame and
+                # stops, instead of drawing forever on the terminal (TD-10).
+                kill -0 "$$" 2>/dev/null || exit 0
                 if [ "$_mode" = count ]; then
                     # The two tests stay nested: merged into a single
                     # condition, an empty file would fall into the plain
@@ -1041,7 +1075,7 @@ spin_stop() {
     kill "$SPINNER_PID" 2>/dev/null || true
     wait "$SPINNER_PID" 2>/dev/null || true
     SPINNER_PID=""
-    printf '\r%78s\r' '' >&2
+    printf '\r%78s\r' '' >&2 || true
     return 0
 }
 
@@ -1063,8 +1097,8 @@ say "Listing the archive ${SNAPSHOT_NAME}."
 : > "$ARCHIVE_RAW"
 rc=0
 spin_start "listing $SNAPSHOT_NAME" "$SPIN_MODE" "$ARCHIVE_RAW"
-# shellcheck disable=SC2086
 if [ "$SPIN_MODE" = count ]; then
+    # shellcheck disable=SC2086
     LC_ALL=en_US.UTF-8 TZ=UTC0 "$STDBUF_BIN" -oL "$TARSNAP_BIN" $TARSNAP_KEYOPT \
         --no-config-exclude --no-config-include --numeric-owner -tv --iso-dates \
         -f "$SNAPSHOT_NAME" > "$ARCHIVE_RAW" || rc=$?
@@ -1299,7 +1333,8 @@ say "Walking the file system."
 : > "$LOCAL_RAW"
 for dir in $BACKUP_DIRS; do
     if [ ! -e "$dir" ]; then
-        printf 'WARNING: BACKUP_DIRS directory missing, skipped: %s\n' "$dir" >&2
+        printf 'WARNING: BACKUP_DIRS directory missing, skipped: %s\n' \
+            "$(ctl_safe "$dir")" >&2
         continue
     fi
     set -- "$dir" -ignore_readdir_race \( -path "$TMP_DIR" -o -path "$LOGFILE_WORK"
@@ -1317,7 +1352,7 @@ for dir in $BACKUP_DIRS; do
     TZ=UTC0 "$FIND_BIN" "$@" >> "$LOCAL_RAW" || _frc=$?
     if [ "$_frc" -ne 0 ]; then
         printf 'WARNING: find reported errors under %s, the inventory may be incomplete\n' \
-            "$dir" >&2
+            "$(ctl_safe "$dir")" >&2
         FIND_ERRORS="${FIND_ERRORS:+$FIND_ERRORS }$dir"
     fi
 done
@@ -1400,7 +1435,7 @@ LC_ALL=C "$JOIN_BIN" -t "$TAB"      "$ARCHIVE_META" "$LOCAL_META" > "$COMMON_LIS
 # counters, is put in front of them in step 6, once those are known.
 
 log() {
-    printf '%s\n' "$*" >&3
+    ctl_safe "$*" >&3
 }
 
 del_count=0
@@ -1578,14 +1613,14 @@ if [ "$cand_count" -gt 0 ]; then
             # no longer, a regular file is not compared (TD-03).
             if [ -h "/$path" ] || [ ! -f "/$path" ]; then
                 printf 'WARNING: no longer a regular file, verdict forced to "modified": %s\n' \
-                    "$path" >&2
+                    "$(ctl_safe "$path")" >&2
                 printf '*\t%s\n' "$path"
                 continue
             fi
             if [ -h "$EXTRACT_DIR/$path" ] || { [ -e "$EXTRACT_DIR/$path" ] &&
                     [ ! -f "$EXTRACT_DIR/$path" ]; }; then
                 printf 'WARNING: extracted as something other than a regular file, verdict forced to "modified": %s\n' \
-                    "$path" >&2
+                    "$(ctl_safe "$path")" >&2
                 printf '*\t%s\n' "$path"
                 continue
             fi
@@ -1593,7 +1628,7 @@ if [ "$cand_count" -gt 0 ]; then
                 # Not downloaded: nothing can be asserted, so we take good
                 # care not to claim that it is identical. Cautious verdict.
                 printf 'WARNING: not downloaded, verdict forced to "modified": %s\n' \
-                    "$path" >&2
+                    "$(ctl_safe "$path")" >&2
                 printf '*\t%s\n' "$path"
                 continue
             fi
@@ -1611,7 +1646,7 @@ if [ "$cand_count" -gt 0 ]; then
                 0) printf '=\t%s\n' "$path" ;;
                 1) printf '*\t%s\n' "$path" ;;
                 *) printf 'WARNING: cmp returned %s, verdict forced to "modified": %s\n' \
-                       "$_rc" "$path" >&2
+                       "$_rc" "$(ctl_safe "$path")" >&2
                    printf '*\t%s\n' "$path" ;;
             esac
         done < "$CANDIDATES"
