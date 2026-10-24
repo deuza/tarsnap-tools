@@ -19,6 +19,7 @@
 #       Replays the decision against a real list of archives, read from a
 #       file or from standard input:
 #           tarsnap --list-archives | ./rotation-check.sh -l -
+#       The archives are those of this machine, or of the host named by -H.
 #
 # The retention values are read directly from tarsnap-backup.sh.
 #
@@ -54,6 +55,8 @@ OPT_WEEKLY=""
 OPT_MONTHLY=""
 OPT_DOW=""
 OPT_DOM=""
+OPT_HOST=""       # host of the replayed archives, set by -H
+HOST_SET=0
 
 # The only place where a binary is called without its absolute path:
 # usage() can be reached through -h BEFORE the safeguard loop, and a wrong
@@ -71,8 +74,8 @@ usage() {
         _rest=${_rest#?}
     done
     cat >&2 <<EOF
-usage: ${0##*/} [-D days] [-f script] [-d DAILY] [-w WEEKLY]
-$_pad [-m MONTHLY] [-o DOW] [-M DOM] [-l file|-] [-h]
+usage: ${0##*/} [-h] [-D days] [-f script] [-d DAILY] [-w WEEKLY]
+$_pad [-m MONTHLY] [-o DOW] [-M DOM] [-l file|-] [-H host]
 
   -D days     simulation horizon (default $DAYS)
   -f script   path of the tarsnap-backup.sh to read the configuration from
@@ -82,6 +85,7 @@ $_pad [-m MONTHLY] [-o DOW] [-M DOM] [-l file|-] [-h]
   -o DOW      override the day of the week kept, 0=Sunday
   -M DOM      override the day of the month kept
   -l file     replay against a real list of archives, "-" for stdin
+  -H host     host of the replayed archives, instead of this machine
   -h          display this help
 
 Without overrides, the five retention values are read from tarsnap-backup.sh.
@@ -95,7 +99,7 @@ die() {
     exit 1
 }
 
-while getopts "D:f:d:w:m:o:M:l:h" opt; do
+while getopts "D:f:d:w:m:o:M:l:H:h" opt; do
     case "$opt" in
         D) DAYS=$OPTARG ;;
         f) BACKUP_SCRIPT=$OPTARG ;;
@@ -105,6 +109,7 @@ while getopts "D:f:d:w:m:o:M:l:h" opt; do
         o) OPT_DOW=$OPTARG ;;
         M) OPT_DOM=$OPTARG ;;
         l) LISTFILE=$OPTARG ;;
+        H) OPT_HOST=$OPTARG; HOST_SET=1 ;;
         h) usage 0 ;;
         *) usage 1 ;;
     esac
@@ -120,6 +125,17 @@ if [ "$#" -gt 0 ]; then
     printf '  options start with an ASCII "-", and a dash pasted from a\n' >&2
     printf '  document is not one\n' >&2
     usage 1
+fi
+
+# -H names the host whose archives a replay decides, for a list fetched
+# from another machine (RC-03). It means nothing to a simulation.
+if [ "$HOST_SET" -eq 1 ]; then
+    if [ -z "$LISTFILE" ]; then
+        die "-H only applies to a replay, with -l"
+    fi
+    if [ -z "$OPT_HOST" ]; then
+        die "-H needs a host name"
+    fi
 fi
 
 # --- Safeguards ---
@@ -425,11 +441,20 @@ decide() {
     return 0
 }
 
-# Replay mode: prints the name of an archive, indented by two spaces and
-# padded to NAME_WIDTH, then its verdict. The padding is counted with
-# parameter expansions, as in usage(), so the printf format stays constant.
+# Prints an archive name with every byte outside printable ASCII replaced
+# by "?": a name holding ESC or CR would otherwise drive the terminal of
+# root, or garble the cron mail.
+shown() {
+    printf '%s\n' "$1" | LC_ALL=C "$SED_BIN" 's/[^ -~]/?/g'
+}
+
+# Replay mode: prints the name of an archive as shown() gives it, so that
+# its control characters cannot drive the terminal (N-R2-4), indented by
+# two spaces and padded to NAME_WIDTH, then its verdict. The padding is
+# counted with parameter expansions, as in usage(), so the printf format
+# stays constant.
 print_verdict() {
-    _name=$1
+    _name=$(shown "$1")
     while [ "${#_name}" -lt "$NAME_WIDTH" ]; do
         _name="$_name "
     done
@@ -448,7 +473,11 @@ if [ -n "$LISTFILE" ]; then
     ###########################################################################
     # REPLAY MODE against a real list
     ###########################################################################
-    COMPUTER=$("$UNAME_BIN" -n)
+    if [ -n "$OPT_HOST" ]; then
+        COMPUTER=$OPT_HOST
+    else
+        COMPUTER=$("$UNAME_BIN" -n)
+    fi
     if [ "$LISTFILE" = "-" ]; then
         "$CAT_BIN" > "$TMP"
     else
@@ -461,12 +490,13 @@ if [ -n "$LISTFILE" ]; then
     LC_ALL=C "$SORT_BIN" -o "$TMP" "$TMP"
 
     # Width of the name column: at least 32 characters, widened to the
-    # longest name of the list, so that a long snapshot name does not shift
-    # the verdicts.
+    # longest name of the list as shown() prints it, so that a long
+    # snapshot name does not shift the verdicts.
     NAME_WIDTH=32
     while IFS= read -r archive; do
-        if [ "${#archive}" -gt "$NAME_WIDTH" ]; then
-            NAME_WIDTH=${#archive}
+        _shown=$(shown "$archive")
+        if [ "${#_shown}" -gt "$NAME_WIDTH" ]; then
+            NAME_WIDTH=${#_shown}
         fi
     done < "$TMP"
 
