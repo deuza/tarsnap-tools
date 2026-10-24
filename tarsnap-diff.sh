@@ -24,11 +24,11 @@
 #
 # The details go to a log file, not to the screen: on a real machine there
 # are tens of thousands of lines, and a terminal's buffer is not an analysis
-# tool. The detail lines are written as they come, to a descriptor kept
-# open, so you can follow the diff being built from another terminal while
-# the script is running:
+# tool. The detail lines are written as they come to a working file
+# created next to the log, whose path -v prints, so you can follow the diff
+# being built from another terminal while the script is running:
 #
-#     tail -f /var/log/tarsnap-diff.sh-<snapshot>.log
+#     tail -f /var/log/tarsnap-diff.sh-<snapshot>.log.XXXXXXXX
 #
 # The header, which carries the four counters, is only added at the very
 # end, at the top of the file, because the counters are obviously only
@@ -41,10 +41,10 @@
 # lines, 13 in metadata-only mode, when the selected categories include
 # neither -i nor -m.
 #
-# This prepending is done by rewriting into a neighbouring file and then
-# renaming it: the operation is atomic, but it changes the inode, so a
-# "tail -f" started during the run follows the old file and will have to
-# be restarted to see the header.
+# The log itself is only replaced at the very end, by renaming onto its
+# path a file that holds the header followed by the details: the operation
+# is atomic, and a run that fails or is interrupted leaves the previous log
+# of the same snapshot untouched (TD-11).
 #
 # The log is plain text, with no ANSI sequences: it is a file meant to be
 # grepped ("grep '^\*'"), not terminal output.
@@ -718,7 +718,7 @@ if [ -n "$TARSNAP_PASSPHRASE" ]; then
     TARSNAP_KEYOPT="$TARSNAP_KEYOPT $TARSNAP_PASSPHRASE"
 fi
 
-# --- Opening the log ---
+# --- Checking the path of the log ---
 if [ -n "$OPT_LOGFILE" ]; then
     LOGFILE=$OPT_LOGFILE
 else
@@ -728,25 +728,35 @@ case "$LOGFILE" in
     */*) LOGDIR_EFF=${LOGFILE%/*} ;;
     *)   LOGDIR_EFF="." ;;
 esac
+[ -n "$LOGDIR_EFF" ] || LOGDIR_EFF=/
 [ -d "$LOGDIR_EFF" ] || die "log directory does not exist: $LOGDIR_EFF"
 [ ! -d "$LOGFILE" ] || die "log path is a directory: $LOGFILE"
 
-# The log is created by mktemp next to its final path, then renamed onto
-# it, rather than opened in place: with -l pointing into a directory that
-# everyone can write to, /tmp for instance, a symbolic link planted
-# beforehand under the name of the log would be followed, whereas
-# rename() replaces it. The log is thus in mode 0600 from the start, like
-# its final version, see step 6.
-_log_new=$("$MKTEMP_BIN" "${LOGFILE}.XXXXXXXX") \
-    || die "log not writable: $LOGFILE"
-"$MV_BIN" -f "$_log_new" "$LOGFILE" \
-    || { "$RM_BIN" -f "$_log_new"; die "log not writable: $LOGFILE"; }
+# The path of the log is made absolute and canonical, its directory being
+# resolved by the shell itself: a relative -l, a "//" or a symbolic link in
+# the directory part would otherwise escape the check against BACKUP_DIRS
+# below (TD-08). The last component is kept as given, and checked next.
+LOGDIR_EFF=$(CDPATH='' cd -P -- "$LOGDIR_EFF" && pwd -P) \
+    || die "log directory not accessible: $LOGDIR_EFF"
+LOGFILE="${LOGDIR_EFF%/}/${LOGFILE##*/}"
 
-# Working file for the final prepending, created by mktemp in step 6, next
-# to the log so that the rename stays within the same file system, hence
-# atomic. Declared here, empty, because cleanup() must be able to test it,
-# and set -u would kill the script on a variable still undefined at the
-# time of a signal.
+# Only a regular file, or nothing yet, is accepted under the name of the
+# log: the final rename would replace a device such as /dev/null, or a
+# symbolic link, with a regular file, for every other user of that name
+# until the next reboot (N-R3-2).
+if [ -L "$LOGFILE" ] || { [ -e "$LOGFILE" ] && [ ! -f "$LOGFILE" ]; }; then
+    die "log path is not a regular file: $LOGFILE"
+fi
+
+# Working files of the log, both created by mktemp next to it: LOGFILE_WORK
+# once the temporary directory exists, for the detail lines as they come,
+# and LOGFILE_TMP in step 6, for the header followed by those lines.
+# Nothing touches the log itself before the final rename, so a run that
+# fails or is interrupted leaves the previous log of the same snapshot as
+# it was (TD-11). Declared here, empty, because cleanup() must be able to
+# test them, and set -u would kill the script on a variable still
+# undefined at the time of a signal.
+LOGFILE_WORK=""
 LOGFILE_TMP=""
 
 # Timestamp taken at the START and kept: the header is only written at the
@@ -797,12 +807,21 @@ cleanup() {
             "$RM_BIN" -rf "$TMP_DIR"
         fi
     fi
-    # The prepending working file only makes sense between its creation
-    # and the rename, which resets the variable to empty. If it is still
-    # lying around here, we exited halfway through: it must not survive
-    # next to the log, where it would look like a second, truncated log.
+    # The working files of the log only make sense until the final rename,
+    # which resets both variables to empty. If one of them is still lying
+    # around here, we exited halfway through: the previous log stays as it
+    # was, and these files must not survive next to it, where they would
+    # look like a second, truncated log. --debug keeps the details file, as
+    # it keeps the temporary directory.
     if [ -n "$LOGFILE_TMP" ] && [ -f "$LOGFILE_TMP" ]; then
         "$RM_BIN" -f "$LOGFILE_TMP"
+    fi
+    if [ -n "$LOGFILE_WORK" ] && [ -f "$LOGFILE_WORK" ]; then
+        if [ "$DEBUG" -eq 1 ]; then
+            printf 'DEBUG: details of the log kept: %s\n' "$LOGFILE_WORK" >&2
+        else
+            "$RM_BIN" -f "$LOGFILE_WORK"
+        fi
     fi
     return 0
 }
@@ -825,6 +844,25 @@ trap 'cleanup; exit 143' TERM
 TMP_DIR=$("$MKTEMP_BIN" -d "${TMPDIR:-/tmp}/tarsnap-diff.XXXXXXXX") \
     || die "cannot create the temporary directory in ${TMPDIR:-/tmp}"
 dbg "TMP_DIR=$TMP_DIR"
+
+# The working file of the log: a random name created with O_EXCL, in mode
+# 0600, so that nothing planted beforehand under that name can be followed
+# or reused. It is opened at once, for appending on descriptor 3 and for
+# reading on descriptor 4, and never reopened by its path: replacing that
+# name during the run no longer changes what the script writes or reads
+# (N-R1-16). The probe in a subshell comes first because, under dash, a
+# redirection of exec that fails stops the shell before die can speak
+# (TB-08, TD-12).
+LOGFILE_WORK=$("$MKTEMP_BIN" "${LOGFILE}.XXXXXXXX") \
+    || die "log not writable: cannot create a file next to $LOGFILE"
+if ! (exec 3>>"$LOGFILE_WORK") 2>/dev/null ||
+        ! (exec 4<"$LOGFILE_WORK") 2>/dev/null; then
+    die "log not writable: $LOGFILE_WORK"
+fi
+exec 3>>"$LOGFILE_WORK"
+exec 4<"$LOGFILE_WORK"
+dbg "LOGFILE_WORK=$LOGFILE_WORK"
+say "Details written as they come to $LOGFILE_WORK."
 
 ARCHIVE_RAW="$TMP_DIR/archive.raw"
 ARCHIVE_META="$TMP_DIR/archive.meta"
@@ -1073,14 +1111,14 @@ LC_ALL=C "$JOIN_BIN" -t "$TAB"      "$ARCHIVE_META" "$LOCAL_META" > "$COMMON_LIS
 # STEP 5: LOG
 ###############################################################################
 
-# The log is opened once and for all on descriptor 3, and kept open until
-# the end. Each line therefore reaches it immediately, with no
-# intermediate buffer, and a "tail -f" from another terminal sees the diff
-# being built instead of waiting for the script to return.
+# The detail lines go to descriptor 3, opened on the working file of the
+# log when it was created, and kept open until the end. Each line
+# therefore reaches it immediately, with no intermediate buffer, and a
+# "tail -f" of that file from another terminal sees the diff being built
+# instead of waiting for the script to return.
 #
 # Only the detail lines go through it. The header, which carries the four
-# counters, is prepended to them in step 6, once those are known.
-exec 3>>"$LOGFILE" || die "log not writable: $LOGFILE"
+# counters, is put in front of them in step 6, once those are known.
 
 log() {
     printf '%s\n' "$*" >&3
@@ -1261,13 +1299,16 @@ fi
 ###############################################################################
 
 # The header could not be written earlier: it carries the four counters,
-# which are only known here. It is therefore built in a neighbouring file,
-# the accumulated detail is copied into it, and it is renamed over the log.
+# which are only known here. It is therefore written in a second working
+# file, followed by the details read back through descriptor 4, and that
+# file is renamed onto the log.
 #
-# Neighbouring, and not in TMP_DIR: rename(2) does not cross file systems,
-# and TMP_DIR lives under /tmp, which is very often elsewhere. The local
-# rename is atomic, so the log is never left truncated, even if the
-# machine goes down during the operation.
+# Next to the log, and not in TMP_DIR: rename(2) does not cross file
+# systems, and TMP_DIR lives under /tmp, which is very often elsewhere. The
+# local rename is atomic, so the log is never left truncated, even if the
+# machine goes down during the operation. -T makes mv replace whatever
+# entry holds the name of the log at that moment, rather than move the file
+# into a directory that a symbolic link would point to (TD-06).
 exec 3>&-
 
 # mktemp rather than a name derived from the PID: with -l pointing into a
@@ -1298,11 +1339,14 @@ LOGFILE_TMP=$("$MKTEMP_BIN" "${LOGFILE}.XXXXXXXX") \
     printf '# new        (>) : %s\n'   "$new_count"
     printf '# identical  (=) : %s\n'   "$id_count"
     printf '# modified   (*) : %s\n'   "$mod_count"
-    "$CAT_BIN" "$LOGFILE"
+    "$CAT_BIN" <&4
 } > "$LOGFILE_TMP" || die "cannot write: $LOGFILE_TMP"
+exec 4<&-
 
-"$MV_BIN" -f "$LOGFILE_TMP" "$LOGFILE" || die "cannot rename: $LOGFILE_TMP"
+"$MV_BIN" -fT "$LOGFILE_TMP" "$LOGFILE" || die "cannot rename: $LOGFILE_TMP"
 LOGFILE_TMP=""
+"$RM_BIN" -f "$LOGFILE_WORK"
+LOGFILE_WORK=""
 
 printf 'Diff of %s\n\n' "$SNAPSHOT_NAME"
 printf '  deleted     (<) : %s\n' "$del_count"
