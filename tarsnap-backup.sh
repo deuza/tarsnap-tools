@@ -506,6 +506,20 @@ while getopts "dFhnovs:" option; do
     esac
 done
 
+# getopts stops at the first operand and leaves it, with everything after
+# it, in $@. The script takes none: an operand is a mistyped option, such
+# as "dry-run" without its dashes, or a "--dry-run" pasted from a document
+# whose dashes are typographic ones (U+2013, U+2014) rather than the ASCII
+# hyphen-minus. Ignored, it used to turn a requested dry-run into a real
+# backup followed by a real purge, without a word. Refused, with the help.
+shift $((OPTIND - 1))
+if [ "$#" -gt 0 ]; then
+    printf 'ERROR: unexpected argument: %s\n' "$1" >&2
+    printf '  options start with an ASCII "-", and a dash pasted from a\n' >&2
+    printf '  document is not one\n' >&2
+    usage 1
+fi
+
 ###############################################################################
 # SAFEGUARDS
 ###############################################################################
