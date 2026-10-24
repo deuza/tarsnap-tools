@@ -44,6 +44,7 @@ UNAME_BIN="/usr/bin/uname"
 LOCALE_BIN="/usr/bin/locale"
 GREP_BIN="/usr/bin/grep"
 SED_BIN="/usr/bin/sed"
+SORT_BIN="/usr/bin/sort"
 DPKG_BIN="/usr/bin/dpkg"
 APT_BIN="/usr/bin/apt"
 FLOCK_BIN="/usr/bin/flock"
@@ -97,11 +98,14 @@ PKG_LIST="/root/pkg-list.txt"
 # The three windows are CUMULATIVE: they follow one another instead of
 # overlapping. Each tier takes over where the previous one stops, and the
 # total coverage is therefore DAILY days + WEEKLY weeks + MONTHLY months.
+# The weekly and monthly tiers keep the first archive of each week, which
+# starts on DOW, and of each month, which starts on DOM: when the night of
+# DOW or DOM is missed, the next archive of the period stands in for it.
 DAILY=90    # everything is kept over the first N days
-WEEKLY=12   # then, over the next N weeks, those falling on a $DOW
-MONTHLY=48  # then, over the next N months, those falling on a $DOM
-DOW=1       # day of the week kept (0 = Sunday, 1 = Monday)
-DOM=1       # day of the month kept
+WEEKLY=12   # then, over the next N weeks, the first archive of each week
+MONTHLY=48  # then, over the next N months, the first archive of each month
+DOW=1       # first day of the weeks (0 = Sunday, 1 = Monday)
+DOM=1       # first day of the months, from 1 to 31
 
 # --- Purge circuit breaker ---
 # Most archives a single run may delete. Past it, the run deletes nothing,
@@ -429,7 +433,7 @@ conf_keyfile() {
 # Then the ranges: DAILY of at least 1, so that the archive this very run
 # creates never falls outside the daily window and into its own purge; DOW
 # from 0 (Sunday) to 6 (Saturday), as date +%w counts, so that the 7 that
-# cron accepts for Sunday is refused rather than never matching; DOM from
+# cron accepts for Sunday is refused, date +%w never giving it; DOM from
 # 1 to 31. WEEKLY or MONTHLY at 0 disables its tier, as documented. The
 # messages name the variable but never echo its raw value. To be kept
 # identical, byte for byte, to the function of the same name in
@@ -508,7 +512,8 @@ done
 
 # All the configured binaries must be executable.
 for bin in "$TARSNAP_BIN" "$DATE_BIN" "$UNAME_BIN" "$LOCALE_BIN" \
-           "$GREP_BIN" "$SED_BIN" "$DPKG_BIN" "$APT_BIN" "$FLOCK_BIN"; do
+           "$GREP_BIN" "$SED_BIN" "$SORT_BIN" "$DPKG_BIN" "$APT_BIN" \
+           "$FLOCK_BIN"; do
     [ -x "$bin" ] || die "binary missing or not executable: $bin"
 done
 
@@ -822,9 +827,22 @@ say "Fetching the list of archives."
 # shellcheck disable=SC2086
 ARCHIVES=$("$TARSNAP_BIN" $TARSNAP_KEYOPT --list-archives)
 
+# Chronological order, oldest first: the weekly and monthly tiers keep the
+# first archive of each period, so the oldest one of a period must be seen
+# first. The names "hostname-YYYY-MM-DD_HH-MM-SS" sort that way by
+# themselves under the C collation, whatever the locale of the run. The
+# purge list follows the same order.
+ARCHIVES=$(printf '%s\n' "$ARCHIVES" | LC_ALL=C "$SORT_BIN")
+
 # Start again from an empty set of positional parameters: it will serve as
 # the accumulator of the "-f archive" pairs to delete.
 set --
+
+# Weeks and months already represented, as " key key ... ": in the
+# chronological order above, the first archive of each period is the one
+# kept.
+SEEN_WEEKS=" "
+SEEN_MONTHS=" "
 
 # The naming pattern forbids spaces, so splitting on IFS is safe.
 for archive in $ARCHIVES; do
@@ -883,18 +901,68 @@ for archive in $ARCHIVES; do
         continue
     fi
 
-    # Father: the right day of the week, within the weekly window, which
-    # takes over from the daily one and does not overlap it.
-    if [ "$f_dow" -eq "$DOW" ] && [ "$age" -lt "$WEEKLY_SEC" ]; then
-        say "Weekly ($DAILY to $((WEEKLY_SEC / 86400)) days) DOW=$f_dow, kept: $archive"
-        continue
+    # Month of the archive. A month starts on day DOM and ends the day
+    # before the next DOM: moving the date back by DOM - 1 days lands in
+    # the month that names it, for any DOM from 1 to 31, the short months
+    # simply starting a few days later (with DOM=31, the month named
+    # 2026-02 runs from 2026-03-03 to 2026-03-30). m_day is the first day
+    # of that month, from which it counts in the window. Only needed while
+    # the archive is newer than the monthly bound: an older month can no
+    # longer count.
+    m_key=""
+    m_day=""
+    m_unix=0
+    if [ "$f_unix" -gt "$MONTHLY_UNIX" ]; then
+        m_key=$("$DATE_BIN" -d "$day -$((DOM - 1)) days" +%Y-%m)
+        m_ref=$("$DATE_BIN" -d "${m_key}-01 +$((DOM - 1)) days" '+%F %s')
+        m_day=${m_ref% *}
+        m_unix=${m_ref#* }
     fi
 
-    # Grandfather: the right day of the month, within the monthly window,
-    # which in turn takes over from the weekly one.
-    if [ "$f_dom" -eq "$DOM" ] && [ "$f_unix" -gt "$MONTHLY_UNIX" ]; then
-        say "Monthly (beyond $((WEEKLY_SEC / 86400)) days) DOM=$f_dom, kept: $archive"
-        continue
+    # Father: the first archive of each week, a week starting on day DOW,
+    # as long as that day lies within the weekly window, which takes over
+    # from the daily one and does not overlap it. When the night of DOW was
+    # missed, the next archive of the week stands in for it, where the
+    # exact day alone left the week without any archive. A week whose first
+    # day has left the window no longer counts, even if some of its
+    # archives are still inside: with no night missed, the archives kept
+    # are exactly those of the exact day. The archive kept also represents
+    # its month, so that the month does not get a second one below.
+    if [ "$age" -lt "$WEEKLY_SEC" ]; then
+        w_back=$(( (f_dow - DOW + 7) % 7 ))
+        w_ref=$("$DATE_BIN" -d "$day -$w_back days" '+%F %s')
+        w_key=${w_ref% *}
+        w_unix=${w_ref#* }
+        if [ $((NOW_UNIX - w_unix)) -lt "$WEEKLY_SEC" ]; then
+            case "$SEEN_WEEKS" in
+                *" $w_key "*) ;;
+                *)
+                    SEEN_WEEKS="$SEEN_WEEKS$w_key "
+                    SEEN_MONTHS="$SEEN_MONTHS$m_key "
+                    say "Weekly ($DAILY to $((WEEKLY_SEC / 86400)) days)" \
+                        "DOW=$f_dow, first of the week of $w_key," \
+                        "kept: $archive"
+                    continue
+                    ;;
+            esac
+        fi
+    fi
+
+    # Grandfather: the first archive of each month, as defined above, as
+    # long as its first day lies within the monthly window, which in turn
+    # takes over from the weekly one. Same reasons as for the weeks: a
+    # missed night of DOM no longer leaves a month without any archive.
+    if [ -n "$m_key" ] && [ "$m_unix" -gt "$MONTHLY_UNIX" ]; then
+        case "$SEEN_MONTHS" in
+            *" $m_key "*) ;;
+            *)
+                SEEN_MONTHS="$SEEN_MONTHS$m_key "
+                say "Monthly (beyond $((WEEKLY_SEC / 86400)) days)" \
+                    "DOM=$f_dom, first of the month from $m_day," \
+                    "kept: $archive"
+                continue
+                ;;
+        esac
     fi
 
     set -- "$@" -f "$archive"
