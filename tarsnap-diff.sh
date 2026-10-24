@@ -39,7 +39,8 @@
 #
 # which keeps the header alone, since no detail line starts with "#": 11
 # lines, 13 in metadata-only mode, when the selected categories include
-# neither -i nor -m.
+# neither -i nor -m, plus one line for each warning that applies, such as
+# the exclusions of tarsnap.conf.
 #
 # The log itself is only replaced at the very end, by renaming onto its
 # path a file that holds the header followed by the details: the operation
@@ -182,6 +183,7 @@ STRICT=0
 VERBOSE=0
 DEBUG=0
 OPT_EXCLUDE=""
+OPT_EXCLUDE_SET=0
 OPT_LOGFILE=""
 
 # The only place where a binary is called without its absolute path:
@@ -217,7 +219,8 @@ $_pad [-l log] [-f script] [--debug] SNAPSHOT
   -v, --verbose         detail the progress on standard error
   -e, --exclude PATTERNS
                         override BACKUP_EXCLUDE, patterns in quotes and
-                        separated by spaces
+                        separated by spaces, -e "" for none; the
+                        exclusions of tarsnap.conf still apply
   -l, --log FILE        path of the log
                         (default: $LOG_DIR/${0##*/}-SNAPSHOT.log)
   -f, --file SCRIPT     path of tarsnap-backup.sh, from which BACKUP_DIRS,
@@ -294,7 +297,7 @@ while getopts "dnimSvXe:l:f:h" option; do
         S) STRICT=1 ;;
         v) VERBOSE=1 ;;
         X) DEBUG=1; VERBOSE=1 ;;
-        e) OPT_EXCLUDE=$OPTARG ;;
+        e) OPT_EXCLUDE=$OPTARG; OPT_EXCLUDE_SET=1 ;;
         l) OPT_LOGFILE=$OPTARG ;;
         f) BACKUP_SCRIPT=$OPTARG ;;
         h) usage 0 ;;
@@ -328,15 +331,34 @@ fi
 [ $# -eq 1 ] || usage 1
 SNAPSHOT_NAME=$1
 
-# The snapshot name ends up in a log file name and on a command line:
-# anything that would introduce a space or an exotic character is refused.
+NL='
+'
+
+# The snapshot name ends up in the default name of the log: anything that
+# would introduce a "/", a space or an exotic character is then refused.
 # An explicit list rather than a range such as [A-Za-z], whose content
 # depends on the locale. The dot is allowed, for the .part archives.
+# With -l, the name only reaches tarsnap, quoted, and the screen: Tarsnap
+# accepts other names, and so does the script then, except a "/", which no
+# archive of the suite holds, and the control characters, which would
+# drive the terminal (TD-09).
 case "$SNAPSHOT_NAME" in
     "") die "empty snapshot name" ;;
-    *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-]*)
-        die "invalid snapshot name, allowed characters: A-Z a-z 0-9 _ - ." ;;
 esac
+if [ -z "$OPT_LOGFILE" ]; then
+    case "$SNAPSHOT_NAME" in
+        *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-]*)
+            die "invalid snapshot name, allowed characters: A-Z a-z 0-9 _ - ." \
+                "(any other name needs -l)" ;;
+    esac
+else
+    case "$SNAPSHOT_NAME" in
+        */*|*"$NL"*)
+            die "invalid snapshot name: no / and no control character" ;;
+    esac
+    _ctl=$(printf '%s\n' "$SNAPSHOT_NAME" | LC_ALL=C "$SED_BIN" -n '/[[:cntrl:]]/p')
+    [ -z "$_ctl" ] || die "invalid snapshot name: no / and no control character"
+fi
 
 ###############################################################################
 # READING THE CONFIGURATION OF tarsnap-backup.sh
@@ -349,7 +371,15 @@ if [ -z "$BACKUP_SCRIPT" ]; then
         */*) HERE=${0%/*} ;;
         *)   HERE="." ;;
     esac
-    if [ -r "$BACKUP_SCRIPT_INSTALLED" ]; then
+    if [ -e "$BACKUP_SCRIPT_INSTALLED" ]; then
+        # An installed copy that cannot be read stops the tool, instead of
+        # a silent fall back on the copy of the repository: production
+        # often runs with other values, and the diff would describe another
+        # configuration than the one of the backups (N-R1-21, RC-05).
+        if [ ! -r "$BACKUP_SCRIPT_INSTALLED" ]; then
+            die "$BACKUP_SCRIPT_INSTALLED exists but is not readable," \
+                "run as root or use -f"
+        fi
         BACKUP_SCRIPT=$BACKUP_SCRIPT_INSTALLED
     elif [ -r "$HERE/tarsnap-backup.sh" ]; then
         BACKUP_SCRIPT="$HERE/tarsnap-backup.sh"
@@ -372,8 +402,18 @@ fi
 #   TARSNAP_KEY="/root/tarsnap.key" # see "keyfile"
 # The value itself can therefore hold no double quote, which none of the
 # variables read here needs.
+#
+# A second line assigning the same name is refused: the shell keeps the
+# last assignment, and reading the first one would compare against another
+# configuration than the backup's. Same rule as read_value() in
+# rotation-check.sh.
 read_string() {
     _name=$1
+    _lines=$("$SED_BIN" -n "/^${_name}=/=" "$BACKUP_SCRIPT")
+    case "$_lines" in
+        *[!0123456789]*)
+            die "$_name is assigned on more than one line in $BACKUP_SCRIPT" ;;
+    esac
     "$GREP_BIN" -q "^${_name}=\"" "$BACKUP_SCRIPT" \
         || die "variable $_name not found in $BACKUP_SCRIPT"
     "$SED_BIN" -n "/^${_name}=/{s/^${_name}=\"\([^\"]*\)\".*/\1/p;q;}" "$BACKUP_SCRIPT"
@@ -384,9 +424,11 @@ BACKUP_DIRS=$(read_string BACKUP_DIRS)
 BACKUP_EXCLUDE=$(read_string BACKUP_EXCLUDE)
 TARSNAP_PASSPHRASE=$(read_string TARSNAP_PASSPHRASE)
 
-if [ -n "$OPT_EXCLUDE" ]; then
+# -e replaces BACKUP_EXCLUDE, even with an empty value: -e "" replays a
+# snapshot taken without exclusions (TD-07).
+if [ "$OPT_EXCLUDE_SET" -eq 1 ]; then
     BACKUP_EXCLUDE=$OPT_EXCLUDE
-    say "BACKUP_EXCLUDE overridden: $BACKUP_EXCLUDE"
+    say "BACKUP_EXCLUDE overridden: ${BACKUP_EXCLUDE:-none}"
 fi
 
 dbg "BACKUP_SCRIPT=$BACKUP_SCRIPT"
@@ -465,6 +507,55 @@ check_excludes() {
 # exclusions match what the backup really archived.
 check_dirs
 check_excludes
+
+# Exclusions of tarsnap.conf. tarsnap -c applied them when it made the
+# snapshot, on top of BACKUP_EXCLUDE, and tarsnap would apply them again
+# to the listing and to the extraction, silently and on one side only.
+# The two tarsnap calls therefore get --no-config-exclude and
+# --no-config-include, and these patterns join BACKUP_EXCLUDE in
+# is_excluded(), on both sides, shown in the header of the log; -e does
+# not replace them (N-R1-19). Read like conf_keyfile() does, but every
+# "  exclude" line counts, of every file read, since tarsnap adds them
+# all up; the trailing slashes go as in check_excludes(). A pattern holding
+# a blank cannot enter the list, and an include directive is not
+# reproduced: both are reported.
+conf_excludes() {
+    _ce_dump=$("$TARSNAP_BIN" --dump-config 2>&1 >/dev/null) || return 1
+    printf '%s\n' "$_ce_dump" | "$SED_BIN" -n \
+        -e '1,/^Reading from config file: /d' \
+        -e 's/^  \(exclude\|include\)[[:space:]]*/\1 /p'
+}
+CONF_EXCLUDE=""
+if _ce_lines=$(conf_excludes); then
+    while IFS= read -r _ce; do
+        case "$_ce" in
+            "include "*)
+                printf 'WARNING: tarsnap.conf has an include directive, which tarsnap-diff.sh does not reproduce: %s\n' \
+                    "${_ce#include }" >&2
+                continue ;;
+        esac
+        _ce=${_ce#exclude }
+        while :; do
+            case "$_ce" in
+                ?*/) _ce=${_ce%/} ;;
+                *) break ;;
+            esac
+        done
+        case "$_ce" in
+            ""|/) continue ;;
+            *[[:space:]]*)
+                printf 'WARNING: exclusion of tarsnap.conf with a blank, not applied by tarsnap-diff.sh: %s\n' \
+                    "$_ce" >&2
+                continue ;;
+        esac
+        CONF_EXCLUDE="${CONF_EXCLUDE:+$CONF_EXCLUDE }$_ce"
+    done <<EOF
+$_ce_lines
+EOF
+else
+    printf 'WARNING: the exclusions of tarsnap.conf could not be read, "tarsnap --dump-config" failed\n' >&2
+fi
+dbg "CONF_EXCLUDE=$CONF_EXCLUDE"
 
 # -S only reinforces the identical/modified distinction: without -i or -m,
 # it has nothing to reinforce. We say so rather than silently ignoring it.
@@ -954,11 +1045,13 @@ rc=0
 spin_start "listing $SNAPSHOT_NAME" "$SPIN_MODE" "$ARCHIVE_RAW"
 # shellcheck disable=SC2086
 if [ "$SPIN_MODE" = count ]; then
-    "$STDBUF_BIN" -oL "$TARSNAP_BIN" $TARSNAP_KEYOPT -tv --iso-dates \
+    "$STDBUF_BIN" -oL "$TARSNAP_BIN" $TARSNAP_KEYOPT \
+        --no-config-exclude --no-config-include -tv --iso-dates \
         -f "$SNAPSHOT_NAME" > "$ARCHIVE_RAW" || rc=$?
 else
     # shellcheck disable=SC2086
-    "$TARSNAP_BIN" $TARSNAP_KEYOPT -tv --iso-dates \
+    "$TARSNAP_BIN" $TARSNAP_KEYOPT \
+        --no-config-exclude --no-config-include -tv --iso-dates \
         -f "$SNAPSHOT_NAME" > "$ARCHIVE_RAW" || rc=$?
 fi
 spin_stop
@@ -995,7 +1088,7 @@ is_excluded() {
     # are tried at every path component; FNM_LEADING_DIR on the right
     # (tar/matching.c, match_exclusion()).
     _abs="/$1"
-    for _pat in $BACKUP_EXCLUDE; do
+    for _pat in $BACKUP_EXCLUDE $CONF_EXCLUDE; do
         case "$_pat" in
             /*|\**)
                 # shellcheck disable=SC2254
@@ -1233,11 +1326,13 @@ if [ "$cand_count" -gt 0 ]; then
         # along, and tarsnap would wait for the answer to a question that
         # nobody can see.
         # shellcheck disable=SC2086
-        "$TARSNAP_BIN" $TARSNAP_KEYOPT -x -C "$EXTRACT_DIR" \
+        "$TARSNAP_BIN" $TARSNAP_KEYOPT --no-config-exclude \
+            --no-config-include -x -C "$EXTRACT_DIR" \
             -f "$SNAPSHOT_NAME" -T "$CANDIDATES" || rc=$?
     else
         # shellcheck disable=SC2086
-        "$TARSNAP_BIN" $TARSNAP_KEYOPT -x -C "$EXTRACT_DIR" \
+        "$TARSNAP_BIN" $TARSNAP_KEYOPT --no-config-exclude \
+            --no-config-include -x -C "$EXTRACT_DIR" \
             -f "$SNAPSHOT_NAME" -T "$CANDIDATES" 2> "$TARSNAP_ERR" || rc=$?
     fi
     spin_stop
@@ -1325,6 +1420,9 @@ LOGFILE_TMP=$("$MKTEMP_BIN" "${LOGFILE}.XXXXXXXX") \
     printf '# date        : %s\n'      "$STARTED_AT"
     printf '# directories : %s\n'      "$BACKUP_DIRS"
     printf '# exclusions  : %s\n'      "$BACKUP_EXCLUDE"
+    if [ -n "$CONF_EXCLUDE" ]; then
+        printf '# tarsnap.conf: %s\n'      "$CONF_EXCLUDE"
+    fi
     if [ "$NEED_BYTE_CHECK" -eq 0 ]; then
         printf '# mode        : metadata only, since neither -i nor -m was requested\n'
         printf '#               no download, so the = and * counters are only\n'
