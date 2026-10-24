@@ -99,7 +99,9 @@
 # exist on both sides they are counted as "identical", since the listing
 # does not provide what is needed to reliably judge a change of link target
 # or of directory permissions. Devices, sockets and named pipes are
-# ignored: they have no business being in BACKUP_DIRS.
+# ignored: they have no business being in BACKUP_DIRS. A hard link, which
+# tarsnap lists with a size of 0 and the name of its target, is compared
+# as the regular file it is (TD-04).
 #
 ###############################################################################
 #
@@ -147,6 +149,7 @@ RM_BIN="/usr/bin/rm"
 MV_BIN="/usr/bin/mv"
 CAT_BIN="/usr/bin/cat"
 SLEEP_BIN="/usr/bin/sleep"
+LOCALE_BIN="/usr/bin/locale"
 
 # stdbuf is NOT mandatory: without it, the spinner loses its live counter
 # and falls back to a bare spinning wheel. It comes from GNU coreutils, is
@@ -441,9 +444,18 @@ dbg "BACKUP_EXCLUDE=$BACKUP_EXCLUDE"
 
 for bin in "$TARSNAP_BIN" "$FIND_BIN" "$SORT_BIN" "$JOIN_BIN" "$CMP_BIN" \
            "$SED_BIN" "$GREP_BIN" "$DATE_BIN" "$MKTEMP_BIN" "$MKDIR_BIN" \
-           "$RM_BIN" "$MV_BIN" "$CAT_BIN" "$SLEEP_BIN"; do
+           "$RM_BIN" "$MV_BIN" "$CAT_BIN" "$SLEEP_BIN" "$LOCALE_BIN"; do
     [ -x "$bin" ] || die "binary missing or not executable: $bin"
 done
+
+# tarsnap runs in en_US.UTF-8, as in tarsnap-backup.sh, whatever the locale
+# of the caller: it then writes the names of the listing that are valid
+# UTF-8 as they are, escapes the others always the same way, and reads the
+# pax headers of the archive without failing (TD-05). Only the two tarsnap
+# calls get it; sort and join keep LC_ALL=C.
+if ! "$LOCALE_BIN" -a 2>/dev/null | "$GREP_BIN" -qix 'en_US\.utf-\?8'; then
+    die "locale en_US.UTF-8 not generated on this system"
+fi
 
 [ -n "$BACKUP_DIRS" ] || die "BACKUP_DIRS is empty in $BACKUP_SCRIPT"
 
@@ -966,8 +978,12 @@ CANDIDATES="$TMP_DIR/candidates"
 VERDICTS="$TMP_DIR/verdicts"
 EXTRACT_DIR="$TMP_DIR/extract"
 TARSNAP_ERR="$TMP_DIR/tarsnap.err"
+ARCHIVE_FILES="$TMP_DIR/archive.files"
+HARD_RAW="$TMP_DIR/hard.raw"
+HARD_LIST="$TMP_DIR/hardlinks"
 
 TAB=$(printf '\t')
+SOH=$(printf '\001')
 
 # Spinner, taken from tarsnap-stats.sh. Two modes: "count" displays the
 # number of lines already received in the watched file, "plain" merely
@@ -1045,13 +1061,13 @@ rc=0
 spin_start "listing $SNAPSHOT_NAME" "$SPIN_MODE" "$ARCHIVE_RAW"
 # shellcheck disable=SC2086
 if [ "$SPIN_MODE" = count ]; then
-    "$STDBUF_BIN" -oL "$TARSNAP_BIN" $TARSNAP_KEYOPT \
-        --no-config-exclude --no-config-include -tv --iso-dates \
+    LC_ALL=en_US.UTF-8 TZ=UTC0 "$STDBUF_BIN" -oL "$TARSNAP_BIN" $TARSNAP_KEYOPT \
+        --no-config-exclude --no-config-include --numeric-owner -tv --iso-dates \
         -f "$SNAPSHOT_NAME" > "$ARCHIVE_RAW" || rc=$?
 else
     # shellcheck disable=SC2086
-    "$TARSNAP_BIN" $TARSNAP_KEYOPT \
-        --no-config-exclude --no-config-include -tv --iso-dates \
+    LC_ALL=en_US.UTF-8 TZ=UTC0 "$TARSNAP_BIN" $TARSNAP_KEYOPT \
+        --no-config-exclude --no-config-include --numeric-owner -tv --iso-dates \
         -f "$SNAPSHOT_NAME" > "$ARCHIVE_RAW" || rc=$?
 fi
 spin_stop
@@ -1069,9 +1085,12 @@ fi
 # The date remains a STRING "YYYY-MM-DD HH:MM:SS" and is never converted
 # to an epoch. This is the performance point of the script. "tarsnap -tv
 # --iso-dates" and "find -printf '%TY-%Tm-%Td %TH:%TM:%TS'" both yield the
-# local time in this format, apart from the fractional seconds that find
-# adds and that we truncate at the dot. Comparing the strings therefore
-# gives exactly the same verdict as comparing epochs, without calling date.
+# time in this format, apart from the fractional seconds that find adds
+# and that we truncate at the dot, and both run with TZ=UTC0: in local
+# time, the hour repeated when the clocks go back prints t and t + 3600 s
+# the same, and a file of the same size rewritten one hour later would
+# pass for identical (N-R2-13). Comparing the strings therefore gives the
+# same verdict as comparing epochs, without calling date.
 #
 # The previous version forked one "date -d" per archive entry. Measured:
 # 0.74 ms per fork on x86, several times more on ARM. Over the 50,000
@@ -1107,39 +1126,170 @@ is_excluded() {
     return 1
 }
 
+# Names of the listing come escaped by tarsnap, in bsdtar_expand_char() of
+# tar/util.c: a backslash is doubled, \a \b \f \n \r \t \v stand for those
+# control characters, and any other byte that is not printable, such as a
+# byte of an invalid UTF-8 sequence, becomes three octal digits. find
+# writes the raw bytes, so the escapes are undone here, once, through
+# printf %b, after \ooo has been turned into \0ooo, the form %b reads
+# (TD-05). The doubled backslashes are first set aside under SOH, a byte
+# that tarsnap never prints raw, so that the test for a newline or a tab
+# only sees real escapes. Returns 1, printing nothing, for such a name: the
+# inventories are lines of tab-separated fields, and these names are
+# counted apart (N-R1-1).
+unescape() {
+    case "$1" in
+        *\\*) ;;
+        *) printf '%s\n' "$1"; return 0 ;;
+    esac
+    _ue=$(printf '%s\n' "$1" | LC_ALL=C "$SED_BIN" -e "s/\\\\\\\\/$SOH/g" \
+        -e 's/\\\([01234567][01234567][01234567]\)/\\0\1/g')
+    case "$_ue" in
+        *'\n'*|*'\t'*|*'\0012'*|*'\0011'*) return 1 ;;
+    esac
+    while :; do
+        case "$_ue" in
+            *"$SOH"*) _ue="${_ue%%"$SOH"*}\\\\${_ue#*"$SOH"}" ;;
+            *) break ;;
+        esac
+    done
+    printf '%b\n' "$_ue"
+}
+
+# Is the entry under one of the directories of BACKUP_DIRS, as they stand
+# today? An entry from a directory removed from BACKUP_DIRS since the
+# snapshot is not reported as deleted, but counted apart (N-R3-1). "/"
+# covers everything; its own entry is named "." on both sides.
+in_dirs() {
+    for _d in $BACKUP_DIRS; do
+        _r=${_d#/}
+        [ -n "$_r" ] || return 0
+        case "$1" in
+            "$_r"|"$_r"/*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 say "Normalising the archive listing."
+skipped_a=0
+outside=0
+lineno=0
 # The redirection applies to the BLOCK, not to each printf: one ">>" per
-# line would reopen the file for each of the 50,000 entries.
+# line would reopen the file for each of the 50,000 entries. Descriptor 6
+# receives the size of every regular file, before any filter, for the hard
+# links; descriptor 7 receives the hard links themselves.
+#
+# Each line is read whole, then split by set --, which set -f keeps from
+# globbing: --numeric-owner leaves no blank in the owner and group fields,
+# so the eight fields stay in place, even for a group such as "domain
+# users" (N-R1-10, TD-16). The name is what follows the date and the time,
+# taken from the line itself so that its blanks are kept; " -> " is only
+# cut for a symbolic link, and " link to " only for a hard link. The line
+# number goes along, for the duplicates of step 4.
 {
-    while read -r perm _links _owner _group size fdate ftime rest; do
-        [ -n "${rest:-}" ] || continue
+    while IFS= read -r line; do
+        lineno=$((lineno + 1))
+        # The fields have to be split on blanks, and set -f rules out
+        # globbing.
+        # shellcheck disable=SC2086
+        set -- $line
+        [ $# -ge 8 ] || continue
+        perm=$1; size=$5; fdate=$6; ftime=$7
+        name=${line#*" $fdate $ftime "}
         # First character of the permissions field, without forking
         # cut(1): everything but the first character is removed by
         # expansion.
         type=${perm%"${perm#?}"}
+        target=""
         case "$type" in
-            -|d|l) ;;
+            -|d) ;;
+            l) name=${name%% -> *} ;;
+            h) target=${name#* link to }; name=${name%% link to *} ;;
             *) continue ;;   # devices, sockets, pipes: not relevant here
         esac
-        name=$rest
-        # The listing appends the target of a link: " -> target" for a
-        # symbolic link, " link to target" for a hard link. We only keep
-        # the name of the entry itself.
-        case "$type" in
-            l) name=${name%% -> *} ;;
-        esac
-        name=${name%% link to *}
         # The listing also appends a "/" to directories, find does not: we
-        # align the two keys.
+        # align the two keys. The root, "./" or "/", becomes ".".
         name=${name%/}
+        [ -n "$name" ] || name=.
+        if ! name=$(unescape "$name"); then
+            skipped_a=$((skipped_a + 1))
+            continue
+        fi
+        if [ "$type" = - ]; then
+            printf '%s\t%s\n' "$name" "$size" >&6
+        fi
+        if ! in_dirs "$name"; then
+            outside=$((outside + 1))
+            continue
+        fi
         is_excluded "$name" && continue
-        printf '%s\t%s\t%s\t%s %s\n' "$name" "$type" "$size" "$fdate" "$ftime"
+        if [ "$type" = h ]; then
+            target=$(unescape "$target") || target=""
+            printf '%s\t%s\t%s %s\t%s\n' "$name" "${target:-?}" "$fdate" "$ftime" "$lineno" >&7
+            continue
+        fi
+        printf '%s\t%s\t%s\t%s %s\t%s\n' "$name" "$type" "$size" "$fdate" "$ftime" "$lineno"
     done < "$ARCHIVE_RAW"
-} > "$ARCHIVE_META"
+} > "$ARCHIVE_META" 6> "$ARCHIVE_FILES" 7> "$HARD_RAW"
+
+# A hard link is listed with a size of 0 and the name of its target, an
+# entry of type "-" listed before it: tarsnap only links to an entry it
+# has already written. The link takes the size of that target, then
+# counts as the regular file that find sees under its own name; a target
+# that cannot be found leaves the size unknown, hence a verdict "*". The
+# list of the links stays for step 5c, which extracts their targets with
+# them (TD-04).
+LC_ALL=C "$SORT_BIN" -t "$TAB" -k2,2 "$HARD_RAW" -o "$HARD_RAW"
+LC_ALL=C "$SORT_BIN" -t "$TAB" -k1,1 -u "$ARCHIVE_FILES" -o "$ARCHIVE_FILES"
+LC_ALL=C "$JOIN_BIN" -t "$TAB" -1 2 -2 1 -a 1 -e '?' -o 1.1,0,2.2,1.3,1.4 \
+    "$HARD_RAW" "$ARCHIVE_FILES" > "$HARD_LIST"
+while IFS="$TAB" read -r name target size stamp lno; do
+    printf '%s\t-\t%s\t%s\t%s\n' "$name" "$size" "$stamp" "$lno"
+done < "$HARD_LIST" >> "$ARCHIVE_META"
+
+if [ "$outside" -gt 0 ]; then
+    printf 'WARNING: %s entries of the snapshot lie outside the current BACKUP_DIRS, ignored\n' \
+        "$outside" >&2
+fi
 
 ###############################################################################
 # STEP 3: CURRENT STATE OF THE FILE SYSTEM
 ###############################################################################
+
+# The walk covers what tarsnap -c archives, and nothing more (N-GAP2-2):
+# - the cache directory of tarsnap stays out, as tarsnap leaves it out
+#   (tar/write.c:956-968), and so do the temporary directory and the
+#   working file of this script (N-GAP2-3);
+# - unless tarsnap.conf has insane-filesystems, the mount point of a
+#   synthetic file system is listed but not entered, as tar/write.c:871-896
+#   does, for the Linux types of synthetic_filesystems[] in
+#   lib-platform/util/ts_getfstype.c;
+# - a name holding a newline or a tab stays out, with everything below it,
+#   and is counted: the inventory is made of lines of tab-separated fields,
+#   where such a name could forge or hide entries (N-R1-1);
+# - -ignore_readdir_race, and errors of find give a warning instead of
+#   stopping the diff after the listing (N-R2-8).
+# The command is built in the positional parameters, which nothing needs
+# any more at this point.
+CACHE_DIR=""
+INSANE_FS=0
+if _cd_dump=$("$TARSNAP_BIN" --dump-config 2>&1 >/dev/null); then
+    CACHE_DIR=$(printf '%s\n' "$_cd_dump" | "$SED_BIN" -n \
+        -e '1,/^Reading from config file: /d' \
+        -e '/^  cachedir[[:space:]]/!d' \
+        -e 's/^  cachedir[[:space:]]*//p' -e 'q')
+    case "$_cd_dump" in
+        *"$NL  insane-filesystems$NL"*|*"$NL  insane-filesystems") INSANE_FS=1 ;;
+    esac
+fi
+case "$CACHE_DIR" in
+    /*) CACHE_DIR=$(CDPATH='' cd -P -- "$CACHE_DIR" 2>/dev/null && pwd -P) || CACHE_DIR="" ;;
+    *)  CACHE_DIR="" ;;
+esac
+dbg "CACHE_DIR=$CACHE_DIR INSANE_FS=$INSANE_FS"
+FIND_FMT='%y\t%s\t%TY-%Tm-%Td %TH:%TM:%TS\t%p\n'
+FIND_ERRORS=""
 
 say "Walking the file system."
 : > "$LOCAL_RAW"
@@ -1148,9 +1298,26 @@ for dir in $BACKUP_DIRS; do
         printf 'WARNING: BACKUP_DIRS directory missing, skipped: %s\n' "$dir" >&2
         continue
     fi
-    "$FIND_BIN" "$dir" \
-        -printf '%y\t%s\t%TY-%Tm-%Td %TH:%TM:%TS\t%p\n' >> "$LOCAL_RAW"
+    set -- "$dir" -ignore_readdir_race \( -path "$TMP_DIR" -o -path "$LOGFILE_WORK"
+    if [ -n "$CACHE_DIR" ]; then
+        set -- "$@" -o -path "$CACHE_DIR"
+    fi
+    set -- "$@" \) -prune -o \( -name "*$NL*" -o -name "*$TAB*" \) -printf '!\n' -prune -o
+    if [ "$INSANE_FS" -eq 0 ]; then
+        set -- "$@" \( -fstype proc -o -fstype sysfs -o -fstype devpts \
+            -o -fstype securityfs -o -fstype selinuxfs -o -fstype usbfs \
+            -o -fstype devfs \) -printf "$FIND_FMT" -prune -o
+    fi
+    set -- "$@" -printf "$FIND_FMT"
+    _frc=0
+    TZ=UTC0 "$FIND_BIN" "$@" >> "$LOCAL_RAW" || _frc=$?
+    if [ "$_frc" -ne 0 ]; then
+        printf 'WARNING: find reported errors under %s, the inventory may be incomplete\n' \
+            "$dir" >&2
+        FIND_ERRORS="${FIND_ERRORS:+$FIND_ERRORS }$dir"
+    fi
 done
+skipped_l=0
 
 {
     # IFS forced to the tab, and not the default IFS: the date field
@@ -1159,6 +1326,10 @@ done
     # name containing a tab would break this format; it would break join
     # anyway as well, which works on the same columns.
     while IFS="$TAB" read -r ftype fsize fstamp fpath; do
+        if [ "$ftype" = '!' ]; then
+            skipped_l=$((skipped_l + 1))
+            continue
+        fi
         [ -n "${fpath:-}" ] || continue
         case "$ftype" in
             f) type=- ;;
@@ -1170,6 +1341,7 @@ done
         # both inventories must carry the same key, so it is removed on
         # this side too.
         name=${fpath#/}
+        [ -n "$name" ] || name=.
         is_excluded "$name" && continue
         # find yields the seconds with their fractional part
         # ("22:43:01.7108968160"), which tarsnap does not print: we
@@ -1177,6 +1349,11 @@ done
         printf '%s\t%s\t%s\t%s\n' "$name" "$type" "$fsize" "${fstamp%%.*}"
     done < "$LOCAL_RAW"
 } > "$LOCAL_META"
+
+if [ "$skipped_a" -gt 0 ] || [ "$skipped_l" -gt 0 ]; then
+    printf 'WARNING: names holding a newline or a tab left out: %s in the snapshot, %s on the system\n' \
+        "$skipped_a" "$skipped_l" >&2
+fi
 
 ###############################################################################
 # STEP 4: MATCHING THE TWO INVENTORIES
@@ -1188,10 +1365,15 @@ done
 # The "-u" applies to the key alone and guards against a duplicate path:
 # two BACKUP_DIRS entries overlapping on the system side, or an archive
 # containing the same path twice, which tarsnap allows. Without it, join
-# would produce the Cartesian product of the duplicates.
+# would produce the Cartesian product of the duplicates. On the archive
+# side, the last occurrence is kept, the one that tarsnap -x restores: a
+# sort by name then by descending line number, then a stable "-u", before
+# the line number is dropped (N-R2-15).
 
 say "Matching the two inventories."
-LC_ALL=C "$SORT_BIN" -t "$TAB" -k1,1 -u "$ARCHIVE_META" -o "$ARCHIVE_META"
+LC_ALL=C "$SORT_BIN" -t "$TAB" -k1,1 -k5,5nr "$ARCHIVE_META" -o "$ARCHIVE_META"
+LC_ALL=C "$SORT_BIN" -t "$TAB" -k1,1 -u -s "$ARCHIVE_META" -o "$ARCHIVE_META"
+"$SED_BIN" -i "s/${TAB}[^${TAB}]*\$//" "$ARCHIVE_META"
 LC_ALL=C "$SORT_BIN" -t "$TAB" -k1,1 -u "$LOCAL_META"   -o "$LOCAL_META"
 
 # By default, join joins on the first field of each file, which is
@@ -1326,12 +1508,12 @@ if [ "$cand_count" -gt 0 ]; then
         # along, and tarsnap would wait for the answer to a question that
         # nobody can see.
         # shellcheck disable=SC2086
-        "$TARSNAP_BIN" $TARSNAP_KEYOPT --no-config-exclude \
+        LC_ALL=en_US.UTF-8 "$TARSNAP_BIN" $TARSNAP_KEYOPT --no-config-exclude \
             --no-config-include -x -C "$EXTRACT_DIR" \
             -f "$SNAPSHOT_NAME" -T "$CANDIDATES" || rc=$?
     else
         # shellcheck disable=SC2086
-        "$TARSNAP_BIN" $TARSNAP_KEYOPT --no-config-exclude \
+        LC_ALL=en_US.UTF-8 "$TARSNAP_BIN" $TARSNAP_KEYOPT --no-config-exclude \
             --no-config-include -x -C "$EXTRACT_DIR" \
             -f "$SNAPSHOT_NAME" -T "$CANDIDATES" 2> "$TARSNAP_ERR" || rc=$?
     fi
@@ -1422,6 +1604,16 @@ LOGFILE_TMP=$("$MKTEMP_BIN" "${LOGFILE}.XXXXXXXX") \
     printf '# exclusions  : %s\n'      "$BACKUP_EXCLUDE"
     if [ -n "$CONF_EXCLUDE" ]; then
         printf '# tarsnap.conf: %s\n'      "$CONF_EXCLUDE"
+    fi
+    if [ "$skipped_a" -gt 0 ] || [ "$skipped_l" -gt 0 ]; then
+        printf '# skipped     : %s in the snapshot, %s on the system, names holding a newline or a tab\n' \
+            "$skipped_a" "$skipped_l"
+    fi
+    if [ "$outside" -gt 0 ]; then
+        printf '# outside dirs: %s entries of the snapshot outside BACKUP_DIRS\n' "$outside"
+    fi
+    if [ -n "$FIND_ERRORS" ]; then
+        printf '# find errors : %s\n'      "$FIND_ERRORS"
     fi
     if [ "$NEED_BYTE_CHECK" -eq 0 ]; then
         printf '# mode        : metadata only, since neither -i nor -m was requested\n'
