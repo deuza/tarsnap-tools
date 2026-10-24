@@ -75,14 +75,19 @@ TARSNAP_KEY="/root/tarsnap.key"
 # tarsnap then silently ignores. No whitespace allowed.
 TARSNAP_PASSPHRASE=""
 
-# Directories to back up (space-separated)
-BACKUP_DIRS="/root /boot /var/www /etc"
+# Directories to back up, space-separated absolute paths. A trailing slash
+# is removed; a relative path, "//", a "." or ".." component and a
+# symbolic link are refused, see check_dirs(). A missing directory is not
+# refused: tarsnap reports it, and the run then ends with exit status 2.
+BACKUP_DIRS="/root /boot /etc"
 
 # Exclusion patterns, space-separated. Two forms are accepted:
 #   - glob pattern ("*/tmp/*"), passed as is to tarsnap
-#   - absolute path ("/var/www/html/APOD"), anchored, hence no side effect.
-#     tarsnap strips the leading / from entry names (except with -P), the
-#     conversion is done further down.
+#   - absolute path ("/var/www/html/APOD"), also passed as is: tarsnap
+#     compares a pattern starting with / with the full path, so that it is
+#     anchored at the root and excludes that path only.
+# A trailing slash is removed, and a pattern made of / alone is refused,
+# see check_excludes().
 BACKUP_EXCLUDE="*/tmp/* /var/www/html/APOD"
 
 # Run lock. In /run, and neither in /tmp nor in /run/lock, which are mode
@@ -511,6 +516,62 @@ check_retention() {
     return 0
 }
 
+# Normalises BACKUP_DIRS in place. The trailing slashes are removed, then
+# every entry that tarsnap would store under another name than its
+# canonical path is refused: a relative path, "//", a "." or ".."
+# component. Under such a name an absolute exclusion no longer matches,
+# and a restore by the canonical path finds nothing. A symbolic link is
+# refused as well: tarsnap would archive the link alone, and nothing of
+# what it points to. A missing directory is not refused.
+# Identical in tarsnap-backup.sh and tarsnap-diff.sh, see HACKING.md.
+check_dirs() {
+    _dirs=""
+    for _d in $BACKUP_DIRS; do
+        while :; do
+            case "$_d" in
+                ?*/) _d=${_d%/} ;;
+                *) break ;;
+            esac
+        done
+        case "$_d" in
+            *//*|*/.|*/..|*/./*|*/../*)
+                die "BACKUP_DIRS: non-canonical path (//, . or ..): $_d" ;;
+            /*) ;;
+            *)
+                die "BACKUP_DIRS: not an absolute path: $_d" ;;
+        esac
+        if [ -L "$_d" ]; then
+            die "BACKUP_DIRS: symbolic link, give the path it points to: $_d"
+        fi
+        _dirs="${_dirs:+$_dirs }$_d"
+    done
+    [ -n "$_dirs" ] || die "BACKUP_DIRS is empty"
+    BACKUP_DIRS=$_dirs
+}
+
+# Normalises BACKUP_EXCLUDE in place. The trailing slashes are removed:
+# tarsnap does the same, but tarsnap-diff.sh compares the patterns as they
+# are written. A pattern made of / alone is refused: it would become "/*",
+# which matches every entry of BACKUP_DIRS, and the archive would be empty
+# without a message, --quiet hiding the warning tarsnap gives about it.
+# Identical in tarsnap-backup.sh and tarsnap-diff.sh, see HACKING.md.
+check_excludes() {
+    _excl=""
+    for _p in $BACKUP_EXCLUDE; do
+        while :; do
+            case "$_p" in
+                ?*/) _p=${_p%/} ;;
+                *) break ;;
+            esac
+        done
+        if [ "$_p" = / ]; then
+            die "BACKUP_EXCLUDE: the pattern / would exclude everything"
+        fi
+        _excl="${_excl:+$_excl }$_p"
+    done
+    BACKUP_EXCLUDE=$_excl
+}
+
 ###############################################################################
 # MAIN
 ###############################################################################
@@ -622,6 +683,11 @@ esac
 # kind, a snapshot or --orphans included, rather than discovered through
 # a purge.
 check_retention
+
+# Directories and exclusion patterns, see check_dirs() and
+# check_excludes(). Same reasoning: in every mode, and before prebackup.
+check_dirs
+check_excludes
 
 # MAX_PURGE follows the rules of the retention values, from 1 to 99999: a
 # decimal integer without a leading zero, five digits at most, checked on
@@ -774,7 +840,9 @@ fi
 if [ "$VERBOSE" -eq 1 ]; then
     TARSNAP_MSGOPT="-v"
 else
-    # --quiet only hides a few warnings ("Removing leading '/'", etc.).
+    # --quiet hides a few warnings ("Removing leading '/'", etc.), among
+    # them "Archive contains no files": an exclusion pattern matching
+    # everything would then go unnoticed, see check_excludes().
     # It is --no-print-stats that neutralises the print-stats directive of
     # tarsnap.conf, responsible for the "All archives / This archive /
     # New data" block printed on stderr in modes c and d. --no-totals and
@@ -848,11 +916,16 @@ set --
 for pattern in $BACKUP_EXCLUDE; do
     case "$pattern" in
         /*)
-            # Absolute path: the leading / is stripped to match the actual
-            # entry names, and both the pattern of the directory and the
-            # pattern of its contents are generated.
-            rel=${pattern#/}
-            set -- "$@" --exclude="$rel" --exclude="$rel/*"
+            # Absolute path, passed as is. tarsnap compares a pattern that
+            # starts with / with the full path on disk, leading / included,
+            # before stripping it from the entry name: the pattern is thus
+            # anchored at the root, and only excludes this path. Without
+            # its leading /, it would be tried at every level of the tree,
+            # and would also exclude any directory of the same name further
+            # down. The second pattern, for the contents, duplicates what
+            # tarsnap already does for the leading directories, and stays
+            # as a safety.
+            set -- "$@" --exclude="$pattern" --exclude="$pattern/*"
             ;;
         *)
             # Pattern already relative or globbed, passed as is.
