@@ -464,6 +464,26 @@ check_retention() {
     return 0
 }
 
+###############################################################################
+# MAIN
+###############################################################################
+
+# The body of the script, from the option parsing to the end, is a single
+# function, main(), called by the very last line of the file. The shell
+# parses a function whole before running it, so the script can be edited,
+# or overwritten in place by nano or cp, while a run is in progress. When
+# the body ran as the shell read it, the shell went on reading the new
+# content at the offset of the old one: bash rereads the script after
+# every external command, dash reads it by blocks of 8 KiB, and fragments
+# of lines, comments included, ran as root, postbackup was skipped, or the
+# test of the monthly tier vanished and the purge took the monthly
+# archives. The body is deliberately not indented, so that this change
+# leaves its lines untouched. The configuration block and the functions
+# stay outside: they are read in the first milliseconds of the run, and
+# the companion tools read the configuration by "NAME=" at the start of a
+# line.
+main() {
+
 # Set by -F or --force-purge, never in the configuration block: lifting
 # the purge circuit breaker is a decision taken for one run, after review,
 # not a setting.
@@ -1031,3 +1051,14 @@ fi
 
 say "Done."
 exit 0
+
+# End of main(), opened above the option parsing.
+}
+
+# The last line of the file, read whole before main() starts: the shell
+# reads nothing beyond it, and exit keeps it that way even if main()
+# were ever to return. ShellCheck sees that main() always exits and
+# reports this exit as unreachable (SC2317): it is there on purpose, and
+# the braces only let the directive cover the whole line.
+# shellcheck disable=SC2317
+{ main "$@"; exit; }
