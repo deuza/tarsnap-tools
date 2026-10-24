@@ -33,8 +33,11 @@
 #     writing to it, which can yield an inconsistent snapshot.
 #   - a passphrase-protected key file cannot be unlocked without a terminal,
 #     so the script simply fails under cron.
-#   - with -k/-c, the borrowed cache directory drifts out of sync and would
-#     need a --fsck, which is a heavy network operation.
+#   - with -k pointing at another machine's key, the snapshot count comes
+#     from that machine and the sizes from this one (see "Key file" above),
+#     and nobody reads the figures of an unattended run to notice the mix.
+#     This script never writes to the cache directory: neither
+#     --list-archives nor --print-stats can put it out of sync.
 # If you want the numbers automatically, call tarsnap with --print-stats from
 # your backup script instead: it costs nothing extra there.
 #
@@ -63,6 +66,7 @@
 #   6  unrecognised "tarsnap --print-stats" output
 #   7  could not create a temporary file
 #   8  -k points at an unreadable key file
+#   9  the tarsnap binary was not found or is not executable
 #   128 + N  stopped by signal N, after cleaning up: 129 HUP (terminal
 #      closed), 130 INT (Ctrl-C), 131 QUIT (Ctrl-\), 143 TERM
 
@@ -288,6 +292,17 @@ spin_stop() {
 # tarsnap prints the offending line on stderr by itself, we only add context.
 rc=0
 "$TARSNAP" "$@" --verify-config || rc=$?
+# 126 and 127 come from the shell, not from tarsnap, which exits with 1 or
+# 2 on errors: the binary could not be run at all ("Permission denied",
+# "not found", printed by the shell just above). Reporting that as a
+# rejected configuration sent the reader looking in the wrong place. This
+# is the first tarsnap call, so the check is only needed here.
+if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
+    printf '%s: cannot run the tarsnap binary: %s\n' "$0" "$TARSNAP" >&2
+    printf '  (exit status %d) - not found in PATH, or not executable\n' \
+        "$rc" >&2
+    exit 9
+fi
 if [ "$rc" -ne 0 ]; then
     printf '%s: "tarsnap --verify-config" rejected the configuration\n' \
         "$0" >&2
