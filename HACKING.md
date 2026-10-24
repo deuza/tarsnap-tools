@@ -33,12 +33,18 @@ The scripts are written in strictly POSIX `sh` and run under `dash` as well as `
 A change that breaks one of these is a regression, whatever it gains elsewhere.
 
 - **Creation before deletion.** The new archive exists before the purge starts, and a failure anywhere before that point deletes nothing.
-- **`set -euf`.** Exit on the first error, unset variables are fatal, no globbing on unquoted expansions. `tarsnap-stats.sh` follows its own repository, with `set -eu`.
-- **`flock` lock on descriptor 9.** The Tarsnap manual forbids two concurrent create or delete operations with the same key. The lock is held by an open descriptor, so the kernel releases it when the process dies, `kill -9`, OOM and power failure included: no stale lock file, and no race between an existence test and a `touch`.
+- **`set -euf`.** Exit on the first error, unset variables are fatal, and no pathname expansion at all: `-f` disables globbing everywhere, patterns written out in full included, not only on unquoted expansions. The hooks get it back, see [Technical choices](#technical-choices). `tarsnap-stats.sh` follows its own repository, with `set -eu`.
+- **`umask 077`.** Set right after `set -euf`, before anything is created: the lock, the package inventories and the dumps of `prebackup` are private to root (N-R1-4).
+- **`flock` lock on descriptor 9.** The Tarsnap manual forbids two concurrent create or delete operations with the same key, and the lock keeps two runs of this machine from overlapping. It is local to the host: two machines sharing a key are not serialised by it, hence one key per machine (N-GAP1-2). The lock is held by an open descriptor, so the kernel releases it when the process dies, `kill -9`, OOM and power failure included: no stale lock file, and no race between an existence test and a `touch`.
+- **Two protections for the lock file.** `/run`, mode 755 and owned by root, reserves the creation and the replacement of the file to root, and the mode 0600 of the file, given by the umask, keeps other users from opening it at all: `flock(2)` also locks a descriptor opened read-only, so a lock readable by all could be held by any local user, blocking the backups (N-R1-5). A lock left in mode 0644 by an earlier version is brought back to 0600 once held, which does not revoke a descriptor that another user already has open: reboot, `/run` being a tmpfs, or delete the file while no backup is running.
 - **Batch purge in a single call.** Every archive to delete goes to one `tarsnap -d`, with `-f` repeated.
+- **Purge circuit breaker.** A real run that would delete more than `MAX_PURGE` archives, 7 by default, deletes none of them and stops with an error, the archive of the run already created and `postbackup` already run. `--dry-run` prints the command and warns. `-F` or `--force-purge` lifts the limit for one run, never from the configuration block (N-R2-1, N-R1-6).
+- **The archive of the current run is never purged.** Its name is compared with each archive of the list before anything else: whatever the clock says, a run cannot leave no archive at all (N-R1-12).
 - **Strict naming pattern as the only purge scope.** Only names that exactly match `hostname-YYYY-MM-DD_HH-MM-SS` can be deleted: `.part` archives, snapshots taken with `-s` and every other name stay out of reach.
+- **The body runs in `main()`, called by the last line.** The shell parses a function whole before running it, so the script can be edited or overwritten while a run is in progress. When the body ran as the shell read it, `dash` reading by blocks of 8 KiB and `bash` rereading after every external command, fragments of the new content ran as root (N-R2-7). The body is deliberately not indented, the configuration block and the functions stay outside `main()`, and the last line, `{ main "$@"; exit; }`, is read whole before `main()` starts.
 - **`tarsnap-backup.sh` is never sourced** by the companion tools, only read: sourcing it would run its option parsing, take its lock and, in the end, make a real backup.
-- **Shared functions stay identical.** `key_is_passphrased()`, `passphrase_reachable()` and `conf_keyfile()` have the same body, byte for byte, in `tarsnap-backup.sh` and in `tarsnap-diff.sh`: see [Passphrase and key detection](#passphrase-and-key-detection).
+- **Shared functions stay identical.** `key_is_passphrased()`, `passphrase_reachable()`, `conf_keyfile()`, `check_dirs()` and `check_excludes()` exist in `tarsnap-backup.sh` and in `tarsnap-diff.sh`; `check_retention()` and `shown()` exist in `tarsnap-backup.sh` and in `rotation-check.sh`. Each pair keeps the same body, byte for byte, which the third command of [Validation](#validation) checks. `shown()` in `tarsnap-stats.sh` follows the same convention with a body of its own, its `sed` being found through `PATH`.
+- **`decide()` follows the purge loop.** `rotation-check.sh` classifies and decides each archive as the purge loop of `tarsnap-backup.sh` does, condition for condition: same classification of the names, same date expressions, same order, same bounds, same sets of the weeks and months already represented, the archives taken in chronological order. The two cannot share a body, the loop acting where `decide()` only returns a verdict: a change to one goes to the other in the same commit, and replaying with `-l` the list given to a `--dry-run --verbose` must give the same verdicts.
 - **Read-only modes take no lock.** `--orphans` and `tarsnap-diff.sh` only list or extract, which the Tarsnap manual allows in parallel with any other operation. `rotation-check.sh` does not run Tarsnap at all.
 - **No code is removed for the sake of optimisation.** A line that looks redundant is often the trace of a bug that was fixed: removing it is a change of its own, with its own justification.
 
@@ -68,14 +74,21 @@ Every change to a script goes through the following, run from the root of the re
 ```sh
 for f in *.sh; do sh -n "$f" && dash -n "$f" && bash -n "$f" || echo "FAILED: $f"; done
 shellcheck -s sh *.sh
-for fn in key_is_passphrased passphrase_reachable conf_keyfile; do
-    b=$(sed -n "/^$fn() {/,/^}/p" tarsnap-backup.sh)
-    d=$(sed -n "/^$fn() {/,/^}/p" tarsnap-diff.sh)
-    [ -n "$b" ] && [ "$b" = "$d" ] || echo "DIFFERENT OR MISSING: $fn"
+for t in key_is_passphrased:tarsnap-backup.sh:tarsnap-diff.sh \
+         passphrase_reachable:tarsnap-backup.sh:tarsnap-diff.sh \
+         conf_keyfile:tarsnap-backup.sh:tarsnap-diff.sh \
+         check_dirs:tarsnap-backup.sh:tarsnap-diff.sh \
+         check_excludes:tarsnap-backup.sh:tarsnap-diff.sh \
+         check_retention:tarsnap-backup.sh:rotation-check.sh \
+         shown:tarsnap-backup.sh:rotation-check.sh; do
+    fn=${t%%:*}; files=${t#*:}; a=${files%%:*}; b=${files#*:}
+    x=$(sed -n "/^$fn() {/,/^}/p" "$a")
+    y=$(sed -n "/^$fn() {/,/^}/p" "$b")
+    [ -n "$x" ] && [ "$x" = "$y" ] || echo "DIFFERENT OR MISSING: $fn in $a and $b"
 done
 ```
 
-All three print nothing when everything is in order. The third one compares the bodies of the functions shared by `tarsnap-backup.sh` and `tarsnap-diff.sh`, see [Passphrase and key detection](#passphrase-and-key-detection). Each mode touched by the change is then run for real, under `dash` and under `bash`, and the documentation is updated in the same commit.
+All three print nothing when everything is in order. The third one compares, pair by pair, the bodies of the shared functions listed under [Invariants](#invariants): each triplet names the function, then the two scripts that hold it. Each mode touched by the change is then run for real, under `dash` and under `bash`, and the documentation is updated in the same commit.
 
 ShellCheck 0.9.0 (Debian Bookworm), 0.10.0 (Debian Trixie) and 0.11.0 (trixie-backports, Forky) report nothing.
 
@@ -93,13 +106,17 @@ Each directive sits right above the command it covers, with its reason in a comm
 
 ## Technical choices
 
-**`prebackup` and `postbackup` are called bare.** Neither `prebackup || die` nor `if ! prebackup`: placing a function in a condition disables `set -e` throughout its body, so a command failing in the middle would be ignored, the following ones would still run, and the function would return 0. This behaviour has been verified to be identical under `dash` and under `bash`. Called bare, the function stops the script on the failing command, whose own message goes to the `cron` mail.
+**`prebackup` and `postbackup` are called bare, through `run_hook()`.** Neither `run_hook prebackup || die` nor `if ! run_hook prebackup`: placing a function in a condition disables `set -e` throughout its body, so a command failing in the middle would be ignored, the following ones would still run, and the function would return 0. This behaviour has been verified to be identical under `dash` and under `bash`. Called bare, the hook stops the script on the failing command, whose own message goes to the `cron` mail.
+
+`run_hook()` runs the hook in a subshell, so that the user's code does not inherit the internals of the script: descriptor 9, which a daemon started by a hook would keep open, every following run then finding the lock taken; the variable named by an `env:` passphrase, which every program started by a hook would receive (N-R5-1); and `-f`, under which `rm -f /root/dumps/*.sql` would remove nothing (N-R4-1). `set -e` remains active in the subshell. `postbackup` runs whatever the outcome of `tarsnap -c`, with its exit status as `$1`: 2, an archive created with unreadable files, gives a warning and a run that exits with 2, and any other failure stops the script before the rotation (TB-02).
+
+Within a hook, `set -e` only stops the script on a command that fails on a line of its own: not in a pipeline, except in its last command, `dash` having no `pipefail`, nor on the left of `&&` or `||`, nor in the condition of an `if` or a `while`. One command per line, and test what has to be tested (N-R2-11).
 
 **`--quiet --no-print-stats`.** Without `--verbose`, the script passes these two options to Tarsnap. `--quiet` silences a few warnings such as "Removing leading '/'", and `--no-print-stats` overrides a `print-stats` directive in `tarsnap.conf`, which would otherwise print the statistics table on every run. The script only speaks up on errors.
 
 **`printf`, not `echo`.** The behaviour of `echo` on a backslash or on an argument starting with `-` is not specified by POSIX: `dash` interprets escape sequences where `bash` does not. `printf` raises no such issue.
 
-**Long options translated by hand.** POSIX `getopts` only knows single-character options. The long forms, with one or two leading dashes, are rewritten into short ones before `getopts` runs. `tarsnap-diff.sh` maps `--debug` to `-X`, a letter deliberately left out of the documented short options.
+**Long options translated by hand.** POSIX `getopts` only knows single-character options. The long forms, with one or two leading dashes, are rewritten into short ones before `getopts` runs. `tarsnap-diff.sh` maps `--debug` to `-X`, a letter deliberately left out of the documented short options. Every script refuses the operands it does not expect: `getopts` stops at the first operand, so a mistyped option, `dry-run` without its dashes or behind a dash pasted from a document, would otherwise be ignored, and a dry-run asked for would become a real run (N-R1-2).
 
 **Absolute binary paths, checked at startup.** They do not depend on the caller's `PATH`, be it `cron`, `systemd` or a misconfigured `sudo`, and a missing binary stops the script before anything else happens. The only exception is `usage()`, which calls `cat` by name: it can be reached through `-h` before the check, and must still display the help.
 
