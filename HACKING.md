@@ -27,7 +27,7 @@ Using the suite only requires the [README](README.md).
 
 `tarsnap-stats.sh` is maintained in [deuza/tarsnap-stats](https://github.com/deuza/tarsnap-stats), which remains its source of truth: it is never modified here, only resynchronised from there, and a fix goes upstream first.
 
-The scripts are written in strictly POSIX `sh` and run under `dash` as well as `bash`, but they target Debian on purpose: binaries under `/usr/bin` (`usrmerge`), GNU `date -d` and `%-d`, GNU `find -printf`, and GNU `sed` reading the binary content of a raw key file.
+The scripts are written in strictly POSIX `sh` and run under `dash`, `bash` and `busybox sh`, `posh` excepted (see [Validation](#validation)), but they target Debian on purpose: binaries under `/usr/bin` (`usrmerge`), GNU `date -d` and `%-d`, GNU `find -printf`, and GNU `sed` reading the binary content of a raw key file.
 
 ## Invariants
 
@@ -73,7 +73,10 @@ Both tools look for `/usr/local/sbin/tarsnap-backup.sh` first, then for a `tarsn
 Every change to a script goes through the following, run from the root of the repository:
 
 ```sh
-for f in *.sh; do sh -n "$f" && dash -n "$f" && bash -n "$f" || echo "FAILED: $f"; done
+for f in *.sh; do
+    sh -n "$f" && dash -n "$f" && bash -n "$f" &&
+        posh -n "$f" && busybox sh -n "$f" || echo "FAILED: $f"
+done
 shellcheck -s sh *.sh
 for t in key_is_passphrased:tarsnap-backup.sh:tarsnap-diff.sh \
          passphrase_reachable:tarsnap-backup.sh:tarsnap-diff.sh \
@@ -91,19 +94,42 @@ done
 
 All three print nothing when everything is in order. The third one compares, pair by pair, the bodies of the shared functions listed under [Invariants](#invariants): each triplet names the function, then the two scripts that hold it. Each mode touched by the change is then run for real, under `dash` and under `bash`, and the documentation is updated in the same commit.
 
+On Debian, `apt install posh busybox shellcheck` provides the tools that are not installed by default.
+
 ShellCheck 0.9.0 (Debian Bookworm), 0.10.0 (Debian Trixie) and 0.11.0 (trixie-backports, Forky) report nothing.
+
+`posh -n` accepts the four scripts, but `posh` does not run `tarsnap-backup.sh` nor `tarsnap-diff.sh`: under `set -u`, it treats `"$@"` without positional parameters as an unset variable, which POSIX has exempted since 2008, and it does not recognise `[[:space:]]` in a `case` pattern. Both scripts stop with `@: parameter not set` from `-h` on (N-GAP2-8). `posh` is therefore not supported: the syntax check only guards against constructs foreign to POSIX, and the scripts run under `dash`, `bash` and `busybox sh`.
+
+### Regression tests, planned
+
+A `tests/` directory is planned, so that the cases found by the audit stay fixed. Proposed layout:
+
+- `tests/stub/tarsnap`: a fake `tarsnap` that logs its arguments, accepts `-c` and `-d`, and serves `--list-archives`, `-tv`, `-x`, `--dump-config` and `--print-stats` from fixture files, so that every mode runs without an account;
+- `tests/lib.sh`: helpers that copy a script with its paths rewritten by `sed` (binaries, key, lock, inventories, log directory), run it, and compare its output and its exit status with the expected ones;
+- `tests/cases/<ID>.sh`: one case per audit finding, named after its identifier, such as `TB-01.sh` or `N-R1-12.sh`, plus the agreement of `rotation-check.sh -l` with a `--dry-run --verbose` of the backup on the same list of archives;
+- `tests/run.sh`: runs every case under `dash`, `bash` and `busybox sh`, prints nothing when all of them pass and exits with a non-zero status otherwise, so that it can join the validation above.
+
+### Building Tarsnap 1.0.41 for the tests
+
+A real client allows `--dry-run` runs without an account, since `tarsnap -c --dry-run` needs no key file. The dependencies on Debian Trixie, after the `BUILDING` file of the tag:
+
+```sh
+apt install gcc libc6-dev make libssl-dev zlib1g-dev libext2fs-dev autoconf automake autoconf-archive
+```
+
+`BUILDING` names `e2fslibs-dev`, which Trixie resolves to `libext2fs-dev`, a package that provides it. `autoconf`, `automake` and `autoconf-archive` are only needed to build from the git tag, through `autoreconf -i`, `./configure` and `make`; `BUILDING` keeps that route for development and recommends the signed tarballs otherwise. Built from the tag, the binary announces itself as `1.0.40-head`, the content of the `tar-version` file of that tag: it is nonetheless built from 1.0.41, commit `066c5ec`.
 
 ## ShellCheck directives
 
-Each directive sits right above the command it covers, with its reason in a comment. There are thirteen of them, for six codes.
+Each directive sits right above the command it covers, with its reason in a comment. There are nineteen of them, for five codes.
 
 | Code | Where | Why |
 |---|---|---|
 | SC2086 | `tarsnap-backup.sh`: archive listing in `list_orphans()` and in the rotation, creation, purge. `tarsnap-diff.sh`: archive listing and extraction, two branches each | `$TARSNAP_KEYOPT`, which carries `--keyfile` and `--passphrase`, and `$TARSNAP_MSGOPT` must vanish from the command line when they are empty, and `$BACKUP_DIRS` is a list. `set -f` rules out globbing. As a consequence, neither the key path, nor the passphrase method, nor the entries of `BACKUP_DIRS` may contain whitespace: both scripts refuse a blank in `TARSNAP_KEY` and `TARSNAP_PASSPHRASE` before their first Tarsnap call. |
 | SC1003 | `key_is_passphrased()`, in both scripts | The backslash belongs to the `i\` command of `sed`: it escapes nothing in the shell. |
-| SC2046 | `rotation-check.sh`, replay mode | `set -- $(date ...)` is meant to split the three fields printed by `date`. |
-| SC2317, SC2329 | `tarsnap-diff.sh`, `cleanup()` | The function is only called from the traps, which ShellCheck does not follow: it believes the body unreachable (SC2317) or, from ShellCheck 0.11.0 on, the function never invoked (SC2329). A single directive covers both codes. |
-| SC2254 | `tarsnap-diff.sh`, `is_excluded()` | The unquoted pattern is the exclusion glob itself: it has to be interpreted, not matched literally. |
+| SC2317, SC2329 | `cleanup()`, in `rotation-check.sh` and in `tarsnap-diff.sh` | The function is only called from the traps, which ShellCheck does not follow: it believes the body unreachable (SC2317) or, from ShellCheck 0.11.0 on, the function never invoked (SC2329). A single directive covers both codes. |
+| SC2317 | `tarsnap-backup.sh`, last line | `main()` always exits, so ShellCheck reports the `exit` of `{ main "$@"; exit; }` as unreachable. It stays on purpose, so that the shell never reads beyond that line even if `main()` were to return, and the braces let the directive cover the whole line (N-R2-7). |
+| SC2254 | `tarsnap-backup.sh`: `list_orphans()`, rotation loop, `is_safe_name()`. `rotation-check.sh`: replay loop. `tarsnap-diff.sh`: `is_excluded()`, two branches | An unquoted expansion used as a pattern, which has to be interpreted rather than matched literally: `$STAMP_GLOB`, the strict stamp of the archive names, in the three loops that classify the names; the explicit character list of `is_safe_name()`; the exclusion glob itself in `is_excluded()`. |
 
 ## Technical choices
 
