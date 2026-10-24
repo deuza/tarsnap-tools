@@ -63,6 +63,8 @@
 #   6  unrecognised "tarsnap --print-stats" output
 #   7  could not create a temporary file
 #   8  -k points at an unreadable key file
+#   128 + N  stopped by signal N, after cleaning up: 129 HUP (terminal
+#      closed), 130 INT (Ctrl-C), 131 QUIT (Ctrl-\), 143 TERM
 
 # -e: abort on the first unhandled failure rather than carrying on with bad
 #     data; every call whose failure we want to inspect ourselves is written
@@ -169,17 +171,28 @@ cleanup() {
         spinner_pid=''
         # Blank the line with a fixed-width field: no ANSI escape needed, so
         # this also behaves on a dumb terminal.
-        printf '\r%78s\r' '' >&2
+        # "|| true": after a HUP the terminal is gone and this write fails
+        # with EIO. Under set -e, bash would then leave cleanup() right here
+        # and the temporary file below would never be removed.
+        printf '\r%78s\r' '' >&2 || true
     fi
     [ -n "$tmpout" ] && rm -f "$tmpout"
     return 0
 }
 
 # The progress line and the temporary file must never outlive the script.
-# cleanup() is idempotent, so the INT/TERM handlers re-entering it via the
+# cleanup() is idempotent, so the signal handlers re-entering it via the
 # EXIT trap is harmless.
+# HUP and QUIT need their own handler: a non-interactive dash keeps their
+# default action, which kills the script without running the EXIT trap, so
+# the temporary file stayed behind and, after Ctrl-\, the spinner went on
+# drawing over the prompt. Under bash, a HUP did run the EXIT trap, but see
+# the "|| true" in cleanup(). The exit statuses are 128 + the signal number,
+# as the shell itself would report them.
 trap 'cleanup' EXIT
+trap 'cleanup; exit 129' HUP
 trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 131' QUIT
 trap 'cleanup; exit 143' TERM
 
 tmpout=$(mktemp "${TMPDIR:-/tmp}/tarsnap-stats.XXXXXX") || {
@@ -202,6 +215,16 @@ else
 fi
 
 # --- Progress reporting -----------------------------------------------------
+# Prints $1 with every byte outside printable ASCII replaced by "?". Archive
+# names are written by --list-archives exactly as they were stored, and
+# tarsnap restricts nothing at creation: a name holding ESC or CR would
+# otherwise drive the terminal. Same convention as shown() in
+# tarsnap-backup.sh, with sed found through PATH like every binary here.
+# LC_ALL=C, exported above, makes the range a range of bytes.
+shown() {
+    printf '%s\n' "$1" | sed 's/[^ -~]/?/g'
+}
+
 # $1: label used until the first line of output shows up (plain spinner mode)
 # $2: "count" to report live progress from $tmpout, anything else for a plain
 #     spinner.
@@ -213,6 +236,12 @@ spin_start() {
     {
         while :; do
             for frame in '|' '/' '-' "\\"; do
+                # The spinner is a background job: if the script dies on a
+                # signal it cannot trap (KILL) or that the shell does not
+                # trap, nobody is left to stop it. It checks every frame that
+                # its parent ($$ keeps the parent's PID in a subshell) still
+                # exists, and leaves quietly when it does not.
+                kill -0 "$$" 2>/dev/null || exit 0
                 if [ "$_mode" = count ]; then
                     # Strictly nothing is drawn until the first archive name
                     # has arrived: during that window tarsnap may still be
@@ -224,6 +253,9 @@ spin_start() {
                         # columns.
                         _n=$(grep -c . "$tmpout" 2>/dev/null || echo 0)
                         _last=$(tail -n 1 "$tmpout" 2>/dev/null || true)
+                        # Control bytes neutralised before they reach the
+                        # terminal, see shown().
+                        _last=$(shown "$_last")
                         [ "$_n" -eq 1 ] && _word=archive || _word=archives
                         printf '\r%s %d %s, last: %.40s' \
                             "$frame" "$_n" "$_word" "$_last" >&2
@@ -245,7 +277,8 @@ spin_stop() {
     kill "$spinner_pid" 2>/dev/null || true
     wait "$spinner_pid" 2>/dev/null || true
     spinner_pid=''
-    printf '\r%78s\r' '' >&2
+    # "|| true": same reason as in cleanup().
+    printf '\r%78s\r' '' >&2 || true
 }
 
 # --- Pre-flight check -------------------------------------------------------
