@@ -122,13 +122,13 @@ apt install gcc libc6-dev make libssl-dev zlib1g-dev libext2fs-dev autoconf auto
 
 ## ShellCheck directives
 
-Each directive sits right above the command it covers, with its reason in a comment. There are nineteen of them, for five codes.
+Each directive sits right above the command it covers, with its reason in a comment. There are twenty-one of them, for five codes.
 
 | Code | Where | Why |
 |---|---|---|
 | SC2086 | `tarsnap-backup.sh`: archive listing in `list_orphans()` and in the rotation, creation, purge. `tarsnap-diff.sh`: archive listing and extraction, two branches each | `$TARSNAP_KEYOPT`, which carries `--keyfile` and `--passphrase`, and `$TARSNAP_MSGOPT` must vanish from the command line when they are empty, and `$BACKUP_DIRS` is a list. `set -f` rules out globbing. As a consequence, neither the key path, nor the passphrase method, nor the entries of `BACKUP_DIRS` may contain whitespace: both scripts refuse a blank in `TARSNAP_KEY` and `TARSNAP_PASSPHRASE` before their first Tarsnap call. |
 | SC1003 | `key_is_passphrased()`, in both scripts | The backslash belongs to the `i\` command of `sed`: it escapes nothing in the shell. |
-| SC2317, SC2329 | `cleanup()`, in `rotation-check.sh` and in `tarsnap-diff.sh` | The function is only called from the traps, which ShellCheck does not follow: it believes the body unreachable (SC2317) or, from ShellCheck 0.11.0 on, the function never invoked (SC2329). A single directive covers both codes. |
+| SC2317, SC2329 | `cleanup()`, in `rotation-check.sh` and in `tarsnap-diff.sh`; `log_exit()`, in `tarsnap-backup.sh` | The function is only called from the traps, which ShellCheck does not follow: it believes the body unreachable (SC2317) or, from ShellCheck 0.11.0 on, the function never invoked (SC2329). A single directive covers both codes. |
 | SC2317 | `tarsnap-backup.sh`, last line | `main()` always exits, so ShellCheck reports the `exit` of `{ main "$@"; exit; }` as unreachable. It stays on purpose, so that the shell never reads beyond that line even if `main()` were to return, and the braces let the directive cover the whole line (N-R2-7). |
 | SC2254 | `tarsnap-backup.sh`: `list_orphans()`, rotation loop, `is_safe_name()`. `rotation-check.sh`: replay loop. `tarsnap-diff.sh`: `is_excluded()`, two branches | An unquoted expansion used as a pattern, which has to be interpreted rather than matched literally: `$STAMP_GLOB`, the strict stamp of the archive names, in the three loops that classify the names; the explicit character list of `is_safe_name()`; the exclusion glob itself in `is_excluded()`. |
 
@@ -165,6 +165,8 @@ Within a hook, `set -e` only stops the script on a command that fails on a line 
 **`tarsnap-diff.sh`: the header of the log.** It carries the counters, so it can only be written last: it is built in a working file that `mktemp` creates next to the log, followed by the accumulated details, then renamed over the log. The rename stays within the same file system, hence it is atomic.
 
 **`tarsnap-diff.sh`: log files created by `mktemp`.** The log is not opened in place: it is created by `mktemp` next to its final path, then renamed onto it. With `-l` pointing into a directory that everyone can write to, `/tmp` for instance, a symbolic link planted beforehand under the name of the log would be followed by an opening in place, whereas `rename()` replaces it. The working file of the header gets a random name for the same reason, created with `O_EXCL`: a predictable name could be planted beforehand, as a link or as a file owned by someone else. Both files are in mode 0600, so the log keeps that mode from start to finish.
+
+**`tarsnap-backup.sh`: a real run ends in the system log.** An EXIT trap, set once the options are read and only for a real run, hands `logger` the exit status, never the text of `die` (N-R1-14), and rewrites `LAST_SUCCESS` after a run that created its archive, status 0 or 2 (N-GAP1-6). HUP, INT and TERM end the run with 129, 130 and 143, so that the trap records them; they run no hook. A subshell does not inherit the trap: a failed hook is logged once, by the main shell. The tests replace `logger` with `tests/stub/logger`, and never write to the system log.
 
 ## Passphrase and key detection
 

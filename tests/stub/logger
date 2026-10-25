@@ -1,0 +1,14 @@
+#!/bin/sh
+#
+# tests/stub/logger: never writes to the system log. Each call adds one
+# line to the file "logger" of the state directory, see tests/stub/tarsnap,
+# its arguments joined by spaces. With logger.rc there, it fails instead,
+# with that exit status.
+
+set -eu
+S=${STUB_STATE_DIR:?STUB_STATE_DIR is not set}
+if [ -f "$S/logger.rc" ]; then
+    read -r rc < "$S/logger.rc"
+    exit "$rc"
+fi
+printf '%s\n' "$*" >> "$S/logger"

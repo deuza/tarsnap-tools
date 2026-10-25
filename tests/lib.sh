@@ -110,7 +110,7 @@ t_init() {
         "$T/usr/local/sbin" "$T/stub/listing" "$T/stub/store"
     cp "$TESTS_DIR/stub/tarsnap" "$TESTS_DIR/stub/uname" \
         "$TESTS_DIR/stub/dpkg" "$TESTS_DIR/stub/apt" \
-        "$TESTS_DIR/stub/apt-mark" "$T/bin/"
+        "$TESTS_DIR/stub/apt-mark" "$TESTS_DIR/stub/logger" "$T/bin/"
     # A wrapper that writes its PID to $1, then execs the rest: the single
     # quotes keep its $$, $1 and $@ for it.
     # shellcheck disable=SC2016
@@ -228,6 +228,8 @@ install_backup() {
         -e "s|^DPKG_BIN=.*|DPKG_BIN=\"$T/bin/dpkg\"|" \
         -e "s|^APT_BIN=.*|APT_BIN=\"$T/bin/apt\"|" \
         -e "s|^APT_MARK_BIN=.*|APT_MARK_BIN=\"$T/bin/apt-mark\"|" \
+        -e "s|^LOGGER_BIN=.*|LOGGER_BIN=\"$T/bin/logger\"|" \
+        -e "s|^LAST_SUCCESS=.*|LAST_SUCCESS=\"$T/root/tarsnap-backup.last-success\"|" \
         -e "s|^TARSNAP_KEY=.*|TARSNAP_KEY=\"$T/tarsnap.key\"|" \
         -e "s|^BACKUP_DIRS=.*|BACKUP_DIRS=\"$T/root\"|" \
         -e "s|^BACKUP_EXCLUDE=.*|BACKUP_EXCLUDE=\"\"|" \
@@ -245,7 +247,7 @@ install_backup() {
 sync_backup() {
     guard_copy "$T/sbin/tarsnap-backup.sh" TARSNAP_BIN UNAME_BIN DPKG_BIN \
         APT_BIN APT_MARK_BIN LOCK_FILE PKG_SELECTIONS PKG_LIST PKG_MANUAL \
-        BACKUP_DIRS
+        BACKUP_DIRS LOGGER_BIN LAST_SUCCESS
     _sb_key=$(sed -n 's/^TARSNAP_KEY="\([^"]*\)".*/\1/p' "$T/sbin/tarsnap-backup.sh")
     if [ -n "$_sb_key" ]; then
         guard_copy "$T/sbin/tarsnap-backup.sh" TARSNAP_KEY
@@ -312,7 +314,7 @@ RUN_STDIN=/dev/null
 RUN_PIDFILE=""
 
 stub_reset() {
-    rm -f "$S"/call.* "$S/calls" "$S/n"
+    rm -f "$S"/call.* "$S/calls" "$S/n" "$S/logger"
     : > "$S/calls"
 }
 

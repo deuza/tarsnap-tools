@@ -57,6 +57,7 @@ APT_BIN="/usr/bin/apt"
 APT_MARK_BIN="/usr/bin/apt-mark"
 FLOCK_BIN="/usr/bin/flock"
 CHMOD_BIN="/usr/bin/chmod"
+LOGGER_BIN="/usr/bin/logger"
 
 # --- Default behaviour, can be overridden by the options ---
 DRY=0            # 1 = dry run: no archive is created or deleted
@@ -129,6 +130,11 @@ LOCK_FILE="/run/tarsnap-backup.lock"
 PKG_SELECTIONS="/root/pkg-selections.txt"
 PKG_LIST="/root/pkg-list.txt"
 PKG_MANUAL="/root/pkg-manual.txt"
+
+# Name of the archive of the last real run that created one, rewritten at
+# the end of such a run, see log_exit(). Its age, checked apart from the
+# runs (by cron, a monitoring or by hand), tells that the backups stopped.
+LAST_SUCCESS="/root/tarsnap-backup.last-success"
 
 # --- Retention: grandfather / father / son scheme ---
 # The three windows are CUMULATIVE: they follow one another instead of
@@ -324,6 +330,40 @@ run_hook() {
             postbackup) postbackup "$2" ;;
         esac
     )
+}
+
+# Ends a real run, from the EXIT trap set once the options are read. A line
+# goes to the system log through logger: without a mail transport, cron
+# throws away the output of the run, and that line is the only trace left.
+# The exit status only, never the text of die. LAST_SUCCESS is rewritten
+# when the archive of the run exists, after a status 0 or 2. Neither a
+# failure of logger nor of that file changes the exit status of the run.
+# Only called from the trap, which ShellCheck does not follow.
+# shellcheck disable=SC2317,SC2329
+log_exit() {
+    case "$1" in
+        0)
+            _le_prio=user.notice
+            _le_text="run succeeded, archive ${NAME:-}"
+            ;;
+        2)
+            _le_prio=user.warning
+            _le_text="run ended with exit status 2, archive ${NAME:-}"
+            ;;
+        *)
+            _le_prio=user.err
+            _le_text="run failed, exit status $1"
+            ;;
+    esac
+    case "$1:${CREATE_RC:-}" in
+        0:0|0:2|2:2)
+            printf '%s\n' "$NAME" > "$LAST_SUCCESS" ||
+                _le_text="$_le_text, $LAST_SUCCESS not written"
+            ;;
+    esac
+    if [ -x "$LOGGER_BIN" ]; then
+        "$LOGGER_BIN" -t tarsnap-backup -p "$_le_prio" -- "$_le_text" || :
+    fi
 }
 
 # Print one family of archives, then the matching delete command. Nothing
@@ -803,6 +843,19 @@ if [ "$#" -gt 0 ]; then
     usage 1
 fi
 
+# A real run ends in the system log, see log_exit(); a dry run, --orphans
+# and --help are run by hand, and read on the terminal. HUP, INT and TERM
+# end the run with the usual status of a signal, so that the EXIT trap
+# records it. No hook runs then, see run_hook(); the shell first waits for
+# the command in progress, tarsnap -c for instance, when only it receives
+# the signal.
+if [ "$DRY" -eq 0 ] && [ "$ORPHANS" -eq 0 ]; then
+    trap 'log_exit "$?"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+fi
+
 ###############################################################################
 # SAFEGUARDS
 ###############################################################################
@@ -810,7 +863,7 @@ fi
 # All the configured binaries must be executable.
 for bin in "$TARSNAP_BIN" "$DATE_BIN" "$UNAME_BIN" "$LOCALE_BIN" \
            "$GREP_BIN" "$SED_BIN" "$SORT_BIN" "$DPKG_BIN" "$APT_BIN" \
-           "$FLOCK_BIN" "$CHMOD_BIN" "$APT_MARK_BIN"; do
+           "$FLOCK_BIN" "$CHMOD_BIN" "$APT_MARK_BIN" "$LOGGER_BIN"; do
     [ -x "$bin" ] || die "binary missing or not executable: $bin"
 done
 
