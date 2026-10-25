@@ -180,7 +180,7 @@ Three functions exist in `tarsnap-backup.sh` and in `tarsnap-diff.sh`, and must 
 | `dev:tty-once` | `/dev/tty` only | `/dev/tty` opens |
 | `dev:stdin-once` | standard input only | standard input is a terminal |
 | `env:NAME` | the variable, through `getenv()` | the variable is set and not empty, tested through `${NAME:+x}`: the value enters neither a shell variable nor the `set -x` trace of `--debug` |
-| `file:PATH` | a single line, ending at its first CR or LF, through `readpass_file()` | the file is readable and holds a single line, neither empty nor starting with a CR; `sed` only answers the verdict, so the passphrase never reaches the shell |
+| `file:PATH` | a single line of at most 2047 bytes, LF included, ending at its first CR, LF or NUL, through `readpass_file()` | the file is readable, is not a directory, and holds a single line of at most 2047 bytes, neither empty nor starting with a CR or a NUL; `sed` reads bytes (`LC_ALL=C`) and only answers the verdict, so the passphrase never reaches the shell |
 
 `/dev/tty` is really opened, rather than tested with `[ -r ]`. An empty variable or file is refused as well: Tarsnap would read an empty passphrase and fail on it, later (TB-11, TD-01). The messages about an invalid `TARSNAP_PASSPHRASE` never print its value (N-R1-14). A file that is not a regular one, a FIFO or a device, is only checked for readability, so as not to consume it. The function sets `PASSPHRASE_HOW` for the verbose message and `PASSPHRASE_WHY` for the error message. Its `eval` only ever sees a variable name validated beforehand, against an explicit list of characters rather than a range such as `[A-Za-z]`, whose content depends on the locale.
 

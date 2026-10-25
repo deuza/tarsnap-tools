@@ -507,18 +507,33 @@ passphrase_reachable() {
         file:*)
             _pp_file=${TARSNAP_PASSPHRASE#file:}
             PASSPHRASE_HOW="read from $_pp_file"
-            PASSPHRASE_WHY="passphrase file $_pp_file unreadable,"
-            PASSPHRASE_WHY="$PASSPHRASE_WHY empty or not a single line"
+            PASSPHRASE_WHY="passphrase file $_pp_file unreadable, a"
+            PASSPHRASE_WHY="$PASSPHRASE_WHY directory, empty, too long or"
+            PASSPHRASE_WHY="$PASSPHRASE_WHY not a single line"
             [ -r "$_pp_file" ] || return 1
+            # A directory passes -r, and tarsnap then fails on reading it:
+            # refused without being read.
+            [ ! -d "$_pp_file" ] || return 1
             [ -f "$_pp_file" ] || return 0
-            # tarsnap ends the passphrase at the first CR or LF: a single
-            # line that is empty, or starts with a CR, gives an empty
-            # passphrase. sed answers y or nothing: the passphrase itself
-            # never reaches the shell, nor its trace.
-            _pp_sed='1{/^\r/d;/^$/d;s/.*/y/p;}'
+            # tarsnap ends the passphrase at the first CR, LF or NUL: a
+            # single line that is empty, or starts with a CR or a NUL,
+            # gives an empty passphrase. sed answers y or nothing: the
+            # passphrase itself never reaches the shell, nor its trace.
+            # The bytes are taken as bytes (LC_ALL=C): in a UTF-8 locale,
+            # . stops at a byte that is not UTF-8, and a passphrase in
+            # Latin-1 was refused.
+            #
+            # tarsnap reads at most 2047 bytes, and refuses a file with
+            # anything left after them (readpass_file(), libcperciva): the
+            # file holds 2047 bytes at most, LF included. sed -z sees the
+            # whole file as one record, up to a NUL, and q1 answers 1 when
+            # it reaches 2048 bytes. A NUL inside a longer file hides the
+            # rest, which tarsnap then refuses itself.
+            _pp_sed='1{/^\r/d;/^\x00/d;/^$/d;s/.*/y/p;}'
             [ -s "$_pp_file" ] &&
                 [ "$("$SED_BIN" -n '$=' "$_pp_file")" = 1 ] &&
-                [ "$("$SED_BIN" -n "$_pp_sed" "$_pp_file")" = y ]
+                [ "$(LC_ALL=C "$SED_BIN" -n "$_pp_sed" "$_pp_file")" = y ] &&
+                LC_ALL=C "$SED_BIN" -z -n '1{/^.\{2048\}/q1;}' "$_pp_file"
             ;;
     esac
 }
