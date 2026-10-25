@@ -41,6 +41,7 @@ They are extensively commented, so that they can be understood, modified, adapte
 - [Configuration](#configuration)
 - [Preparing and cleaning up around the backup](#preparing-and-cleaning-up-around-the-backup)
 - [Usage](#usage)
+- [Monitoring the backups](#monitoring-the-backups)
 - [Archives outside the rotation](#archives-outside-the-rotation)
 - [Checking your retention configuration](#checking-your-retention-configuration)
 - [Comparing a snapshot with the system](#comparing-a-snapshot-with-the-system)
@@ -54,13 +55,15 @@ They are extensively commented, so that they can be understood, modified, adapte
 
 On every run, in this order:
 
-1. It calls `prebackup`, the function that prepares the ground. By default it regenerates the inventory of installed packages, `dpkg --get-selections` and `apt list --installed`, into two files that are themselves included in the backup. Restoring a machine without knowing what was installed on it is an avoidable waste of time. This is also where you will put your database dumps and your calls to external scripts.
+1. It calls `prebackup`, the function that prepares the ground. By default it regenerates the inventory of installed packages, `dpkg --get-selections`, `apt list --installed` and `apt-mark showmanual`, into three files that are themselves included in the backup. Restoring a machine without knowing what was installed on it is an avoidable waste of time. This is also where you will put your database dumps and your calls to external scripts.
 2. It creates a Tarsnap archive named `hostname-YYYY-MM-DD_HH-MM-SS`.
-3. It calls `postbackup`, the counterpart of the first one: cleanup of temporary dumps, notification, restart of a service.
+3. It calls `postbackup`, the counterpart of the first one, whatever the outcome of the creation: cleanup of temporary dumps, notification, restart of a service.
 4. It lists the existing archives and deletes those that meet none of the three retention criteria.
 
-The order is deliberate: the new archive is created **before** anything is destroyed. If Tarsnap fails, because of the network, the quota or the key, `set -e` aborts the script and no archive is deleted.  
+The order is deliberate: the new archive is created **before** anything is destroyed. If Tarsnap fails, because of the network, the quota or the key, the script stops right after `postbackup` and no archive is deleted.  
 The *worst* possible case is therefore "old archives pile up", but never "I purged and I have nothing new".
+
+An exit status 2 from Tarsnap, an archive created while some files could not be read, gives a warning: the rotation then only runs if the new archive is listed, and the run itself exits with status 2.
 
 ## The retention scheme
 
@@ -80,8 +83,8 @@ The three windows **follow one another** instead of overlapping. Each tier takes
 | Tier | Variable | Keeps | Covers |
 |---|---|---|---|
 | Son | `DAILY=90` | all archives | from 0 to 90 days |
-| Father | `WEEKLY=12` | those falling on a `DOW` | from 90 to 174 days |
-| Grandfather | `MONTHLY=48` | those falling on a `DOM` | from 174 to 1635 days |
+| Father | `WEEKLY=12` | the first archive of each week, which starts on `DOW` | from 90 to 174 days |
+| Grandfather | `MONTHLY=48` | the first archive of each month, which starts on `DOM` | from 174 to about 1635 days |
 
 The total coverage is therefore `DAILY` days **plus** `WEEKLY` weeks **plus** `MONTHLY` months, i.e. nearly four and a half years with the shipped values.
 
@@ -92,27 +95,30 @@ With `DAILY=90` and `WEEKLY=12`, the 84 days of the weekly window would fit enti
 
 ### An archive is kept if it meets at least one criterion
 
-The three tests are independent and evaluated in order. The first one that answers "yes" wins, but none of them excludes the others.  
-In practice, an archive dated the 1st of the month is kept by the monthly tier even if it still falls within the date range of the weekly tier and is not a Monday.
+The three tests are evaluated in order, son, then father, then grandfather. The first one that answers "yes" wins, but none of them excludes the others.  
+In practice, the first archive of a month is kept by the monthly tier even if it still falls within the date range of the weekly tier without being the first of its week. Only one rule links two tiers: the archive kept for a week also stands for its month, which then gets no second one.
 
 This is the expected behaviour: the tiers define reasons to keep, not exclusive slices.
 
 ### What it looks like in practice
 
-Over five years of daily backups, with the default values:
+Over five years of daily backups, with the default values, simulated at 14:00 on 25 October 2026:
 
 ```
   son         (daily)    : 90
   father      (weekly)   : 12
-  grandfather (monthly)  : 50
-  deleted                : 1673
+  grandfather (monthly)  : 49
+  deleted                : 1674
   ----------------------------------
-  kept in total          : 152
+  kept in total          : 151
 ```
 
-One hundred and fifty-two archives kept out of one thousand eight hundred and twenty-five.  
+One hundred and fifty-one archives kept out of one thousand eight hundred and twenty-five.  
 These figures are those of the provided diagnostic script `rotation-check.sh`, not an estimate!  
-The exact count depends on the day you run it, since the 1sts of the month do not always fall at the same place in the windows: simulated on every day of 2026 and 2027, it stays between 150 and 153.
+The exact count depends on the day you run it, since the first archives of the months do not always fall at the same place in the windows: simulated at noon on every day of 2027, it stays between 150 and 153.
+
+It also depends on the time of day. At 00:02, the time of the `cron` line given under [Installation](#installation), it ranges from 150 to 154 over the same year: during the 90 days that follow the switch to summer time, the hour it takes away keeps a 91st archive in the son tier, which is indeed less than 90 days old, and the weekly tier keeps 11 or 13 archives on a few days of spring and summer.  
+Run late in the evening instead, the backup would keep one archive fewer in the son tier during the 90 days that follow the switch back to winter time: schedule it shortly after midnight, as above.
 
 ### Why purge so little?
 
@@ -231,7 +237,7 @@ Root's crontab, edited with `crontab -e`, would do just as well, with the same l
 Without `--verbose`, the script is silent in normal operation, even when `tarsnap.conf` sets `print-stats`, `totals` or `progress-bytes`: it overrides them for the run, since their output on standard error would make a `cron` mail every night.  
 Only errors and warnings go to standard error, hence into the `cron` mail, or elsewhere depending on your setup.
 
-A real run that creates its archive and ends with status 0 or 2 also writes the name of that archive to `LAST_SUCCESS`, `/root/tarsnap-backup.last-success` by default. A second line, at noon, checks that this file was rewritten during the last 25 hours, and writes a warning otherwise, hence a `cron` mail as well:
+A real run that creates its archive and ends with status 0 or 2 also writes the name of that archive to `LAST_SUCCESS`, `/root/tarsnap-backup.last-success` by default, see [Monitoring the backups](#monitoring-the-backups). A second line, at noon, checks that this file was rewritten during the last 25 hours, and writes a warning otherwise, hence a `cron` mail as well:
 
 ```
 00 12   * * *   root test -n "$(find /root/tarsnap-backup.last-success -mmin -1500 2>/dev/null)" || echo "tarsnap-backup: no successful run for 25 hours"
@@ -378,7 +384,7 @@ The script sets `umask 077` before creating anything: the lock, the inventories 
 `PKG_SELECTIONS`, `PKG_LIST` and `PKG_MANUAL`: the three inventory files written by `prebackup`, the selections of `dpkg`, the list of `apt`, and the packages installed on purpose, as `apt-mark showmanual` gives them, the list to hand back to `apt` to rebuild a system.  
 Put them in a directory covered by `BACKUP_DIRS`, otherwise they will not make it into the archive.
 
-`LAST_SUCCESS`: the file into which a real run writes the name of its archive when it ends with status 0 or 2, `/root/tarsnap-backup.last-success` by default. Its age tells that the backups have stopped: see the check given under [Installation](#installation).
+`LAST_SUCCESS`: the file into which a real run writes the name of its archive when it ends with status 0 or 2, `/root/tarsnap-backup.last-success` by default. Its age tells that the backups have stopped: see [Monitoring the backups](#monitoring-the-backups).
 
 ## Preparing and cleaning up around the backup
 
@@ -393,7 +399,16 @@ Shipped with the package inventory and a series of commented-out examples, to ad
 prebackup() {
     say "Taking inventory of installed packages."
     "$DPKG_BIN" --get-selections > "$PKG_SELECTIONS"
-    "$APT_BIN" list --installed 2>/dev/null > "$PKG_LIST"
+    if ! _apt_err=$("$APT_BIN" list --installed 2>&1 >"$PKG_LIST"); then
+        printf 'WARNING: apt list failed, incomplete list in %s:\n' \
+            "$PKG_LIST" >&2
+        printf '%s\n' "$_apt_err" >&2
+    fi
+    if ! _mark_err=$("$APT_MARK_BIN" showmanual 2>&1 >"$PKG_MANUAL"); then
+        printf 'WARNING: apt-mark failed, incomplete list in %s:\n' \
+            "$PKG_MANUAL" >&2
+        printf '%s\n' "$_mark_err" >&2
+    fi
 
     # say "Dumping the MySQL databases."
     # /usr/bin/mysqldump --all-databases --single-transaction --quick \
@@ -403,13 +418,24 @@ prebackup() {
 }
 ```
 
+`apt` warns on its standard error, at every call, that its interface is not stable: the message is captured, and only shown when `apt` fails. A failure of `apt` or of `apt-mark` gives a warning, with their own message, but does not stop the backup: the rest of the system is worth more than a list of packages.
+
 Declare the absolute path of your binaries at the top of the script, like the others, rather than relying on `PATH`.  
 And for MySQL, the credentials go in a `~/.my.cnf` with mode 0600, never on the command line, where `ps` would make them visible to every user of the machine.
 
 ### `postbackup`
 
-The counterpart, run once the archive has been created, snapshot included, and before the rotation.  
-Cleanup of temporary dumps, notification, restart of a service stopped by `prebackup`.
+The counterpart, run after the creation of the archive, snapshot included, and before the rotation: cleanup of temporary dumps, notification, restart of a service stopped by `prebackup`.
+
+It runs whatever the outcome of the creation, so that whatever `prebackup` set up is undone in every case, and it receives the exit status of `tarsnap -c` as `$1`:
+
+| `$1` | The creation | Then |
+|---|---|---|
+| 0 | succeeded | the rotation |
+| 2 | made the archive, but some files could not be read | a warning, the rotation if the archive is listed, and a run that exits with status 2 |
+| any other value | failed | the script stops, without touching the rotation |
+
+A snapshot taken with `-s` stops after `postbackup` in every case, without rotating.
 
 It is empty by default, apart from its commented-out examples.
 
@@ -420,12 +446,27 @@ It is empty by default, apart from its commented-out examples.
 Any other value, and any command failing inside it, stops the script:  
 
 - For `prebackup`, this happens **before** the archive is created, hence before any deletion: better to back up nothing than to back up a half-dumped database.  
-- For `postbackup`, the archive is already in place and it is the rotation that gets skipped, so the old archives pile up.
+- For `postbackup`, it is the rotation that gets skipped, so the old archives pile up, and an archive already created stays in place.
 
 In both cases, the script fails in the right direction.
 
+Mind the limits of `set -e`, which does the stopping: it only acts on a command that fails on a line of its own. A failure goes unnoticed in a pipeline, except in its last command, the script not setting `pipefail`, on the left of `&&` or `||`, and in the condition of an `if` or a `while`:
+
+```sh
+/usr/bin/mysqldump --all-databases > /root/dumps/all.sql              # a failure stops the script
+/usr/bin/mysqldump --all-databases | gzip > /root/dumps/all.sql.gz    # a failure of mysqldump goes unnoticed
+```
+
+One command per line, and test what has to be tested.
+
 The error you get is the one printed by the failing command itself.  
-Before adding a command or a script to one of these functions, check that it runs cleanly: a `--dry-run` that leaves nothing in the `cron` mail, or a run with `--verbose`.
+Before adding a command or a script to one of these functions, check that it runs cleanly: a `--dry-run` that prints neither error nor warning, or a run with `--verbose`.
+
+### What the hooks see
+
+Both run in a subshell, so that your code does not inherit the internals of the script, and a variable set in a hook does not reach the rest of the run. Descriptor 9, which holds the lock, is closed there: a daemon started by a hook would otherwise keep the lock, and every following run would find it taken. The variable named by an `env:` passphrase is removed from their environment, so that the programs they start do not receive the passphrase. And pathname expansion, disabled everywhere else by `set -f`, is back on: `rm -f /root/dumps/*.sql` does remove the dumps. `set -e` remains active.
+
+A run killed between the two hooks, by a signal or a reboot, does not run `postbackup`: whatever `prebackup` left, the dumps for instance, stays in place, private to root, until the next run goes through both hooks again.
 
 ### Both functions also run in `--dry-run` mode
 
@@ -435,30 +476,75 @@ A practical consequence, better not discovered in production: if you put a dump 
 ## Usage
 
 ```
-usage: tarsnap-backup.sh [-d|-n|--dry-run] [-v|--verbose] [-h|--help]
+usage: tarsnap-backup.sh [-d|-n|--dry-run] [-v|--verbose] [-F|--force-purge]
        tarsnap-backup.sh [-s|--snapshot-name] NAME
        tarsnap-backup.sh [-o|--orphans]
+       tarsnap-backup.sh [-h|--help]
 ```
 
-`-d`, `-n`, `--dry-run`: full simulation. Nothing is created or deleted, and the purge command that would be executed is displayed.  
+`-d`, `-n`, `--dry-run`: full simulation. Nothing is created or deleted, and the purge command that would be executed is displayed, with a warning when it would exceed `MAX_PURGE`.  
 Beware: the creation is simulated by `tarsnap --dry-run`, which really reads the files: it takes as long as a real run.  
 The faster `--dry-run-metadata` of Tarsnap 1.0.41 is deliberately not used: see [HACKING.md](HACKING.md#the---dry-run-metadata-bug).
+
+A dry run does not check everything, and says so at its end: whether the cache directory is in step with the server, whether the key may delete, and the environment of `cron`. Tarsnap simulates the creation without reading the state of its cache directory: after a reinstall, a rollback or a cache directory restored from elsewhere, every dry run passes and every real run fails. A dry run therefore looks for the `directory` file of the cache directory, and warns when it is missing while the account holds archives: `tarsnap --fsck` rebuilds it. The first real run under `cron` remains the test of the rest.
 
 **Note that the script's `-d` means "delete nothing", the exact opposite of Tarsnap's `-d`: `-n` is accepted as a synonym and remains the less ambiguous form.**
 
 `-v`, `--verbose`: details the decision made for each archive, and passes `-v` to Tarsnap.
 
+`-F`, `--force-purge`: lifts `MAX_PURGE` for this run only, once the purge has been reviewed with `--dry-run --verbose`, see [Retention](#retention).
+
 `-s NAME`, `--snapshot-name NAME`: creates an archive suffixed with `NAME`, then exits without rotating.  
 The suffix takes it out of the pattern tested by the purge, so it becomes permanently untouchable by the script.  
 **This is what to use before going into production, for example.**
 
-The allowed characters are `A-Z`, `a-z`, `0-9`, `_` and `-`. The `--snapshot-name=NAME` form is also accepted.
+The allowed characters are `A-Z`, `a-z`, `0-9`, `_` and `-`. The `--snapshot-name=NAME` form is also accepted. An empty name is refused, and so is a name starting with `-`, most likely an option swallowed by `-s`: `-s --dry-run` would otherwise make a real snapshot.
 
-`-o`, `--orphans`: lists the archives beyond the reach of the rotation, then exits. See the next section.
+`-o`, `--orphans`: lists the archives beyond the reach of the rotation, then exits. See [Archives outside the rotation](#archives-outside-the-rotation).
 
 `-h`, `--help`: displays the help.
 
 Long options also accept a single leading dash: `-dry-run` is read as `--dry-run`.
+
+Anything that is not an option is refused, with the help: `dry-run` without its dashes, or a `--dry-run` pasted from a document whose dashes are typographic ones, would otherwise be ignored, and the dry run asked for would become a real run.
+
+The exit status:
+
+| Status | Meaning |
+|---|---|
+| 0 | the run went through |
+| 1 | stopped by the script itself, with an `ERROR:` line or the help: invalid option or setting, failed creation, purge past `MAX_PURGE`, and so on |
+| 2 | archive created, but some files could not be read, with a `WARNING:` line |
+| 129, 130, 143 | stopped by HUP, INT or TERM |
+
+Any other status, or a 1 or a 2 without such a line, is that of a command that failed under `set -e`, in a hook or in a call to Tarsnap such as the listing or the purge, whose own message comes first.
+
+A status 0 does not prove that every file was read: a file that Tarsnap finds but then cannot open, deleted in the meantime or refused by an NFS export, is left out of the archive with a message, and Tarsnap still exits with 0. Only that message tells.
+
+## Monitoring the backups
+
+A backup that stopped without anyone noticing is worse than none: you believe you have one.  
+Without a mail transport, `cron` throws away what the script writes, errors included. Two traces stay on the machine whatever the setup.
+
+**The system log.** Every real run, scheduled or not, ends with a line tagged `tarsnap-backup`, sent through `logger`:
+
+| Priority | Line | When |
+|---|---|---|
+| `notice` | `run succeeded, archive NAME` | exit status 0 |
+| `warning` | `run ended with exit status 2, archive NAME` | some files could not be read |
+| `err` | `run failed, exit status N` | any other status, the signals included |
+
+The line carries the exit status, never the text of an error, which stays on standard error. A dry run, `--orphans` and `--help` leave no line: they are run by hand, and read on the terminal.  
+Since Debian 12, `rsyslog` is [no longer installed by default](https://www.debian.org/releases/bookworm/amd64/release-notes/ch-information.en.html#changes-to-system-logging), and the line is read from the journal:
+
+```sh
+journalctl -t tarsnap-backup --since yesterday   # the last runs
+journalctl -t tarsnap-backup -p warning          # the warnings and failures only
+```
+
+**The last success.** `LAST_SUCCESS` holds the name of the archive of the last real run that ended with status 0 or 2. A run that stopped earlier, or later, at the purge circuit breaker for instance, leaves it as it was: its age therefore tells how long the backups have been failing, whatever stopped them, the script itself, a `cron` that no longer starts it, or the machine. The line given under [Installation](#installation) checks it every day at noon; without a mail transport, replace its `echo` with `logger -t tarsnap-backup -p user.err`, so that the warning lands in the journal as well.
+
+**The warnings of the rotation.** Before purging, the rotation looks at the newest archive. Dated after today, it points to a clock ahead, here or on the machine that made it; two days old or more, it tells of missed nights, or of a clock now ahead, whose rotation this run applies at once, within `MAX_PURGE`. Both are warnings, the run goes on, and like every other message they go to standard error, not to the system log. [rotation-check.sh](#checking-your-retention-configuration) gives the same warnings in a replay, and tells in advance on which nights the breaker will stop the purge.
 
 ## Archives outside the rotation
 
@@ -476,7 +562,7 @@ The option is read-only: it creates nothing, deletes nothing, and does not even 
 It distinguishes two families, for two different reasons:
 
 **- Orphaned snapshots:**  
-Their names do not match the pattern of the rotation archives, so the purge excludes them outright: snapshots taken with `-s`, archives made by hand, archives of another machine sharing the same key, archives dating from a previous hostname.
+Their names do not match the pattern of the rotation archives, so the purge excludes them outright: snapshots taken with `-s`, archives made by hand, archives left by a machine that once used this key, archives dating from a previous hostname.
 
 This covers any snapshot created with the Tarsnap key under another name: the purge touches **ONLY** what EXACTLY matches the pattern **`hostname-YYYY-MM-DD_HH-MM-SS`**
 
@@ -508,6 +594,8 @@ Archives beyond the reach of the rotation, hostname "foo".
 ```
 
 With `TARSNAP_PASSPHRASE` set, these commands carry the same `--passphrase` option.
+
+Each name is shown with its control characters neutralised, every byte outside printable ASCII becoming `?`, so that a name holding ESC or CR can neither drive your terminal nor garble the `cron` mail. Only the names made of letters, digits, `.`, `_` and `-` go into the delete commands, which can then be pasted without quotes: any other name stays listed above them, and a note counts those left out, to be deleted by hand, name quoted.
 
 ## Checking your retention configuration
 
@@ -813,12 +901,16 @@ It is also listed on [Tarsnap's helper scripts page](https://www.tarsnap.com/hel
 ## Design guarantees
 
 - **Creation before deletion.** Never the other way round, under any circumstances.
-- **`set -euf`.** Exit on the first error, unset variables are fatal, no globbing on unquoted expansions.
-- **`flock` lock on descriptor 9.** Two runs never overlap, as the Tarsnap manual requires for a given key, and the kernel releases the lock even after a `kill -9` or a power failure: no stale lock file to clean up.
+- **`set -euf`.** Exit on the first error, unset variables are fatal, and no pathname expansion at all, patterns written out in full included: only the hooks get it back.
+- **`umask 077`.** Everything the script and its hooks create is private to root.
+- **`flock` lock on descriptor 9.** Two runs of this machine never overlap, as the Tarsnap manual requires for a given key, and the kernel releases the lock even after a `kill -9` or a power failure: no stale lock file to clean up. The lock is local to the host, hence one key per machine.
 - **Batch purge in a single call.** All the archives to delete go to one `tarsnap -d`, which noticeably speeds up the purge.
+- **Purge circuit breaker.** A run that would delete more than `MAX_PURGE` archives deletes none of them.
+- **The archive of the run is never purged by the run itself,** whatever the clock says.
 - **Strict naming pattern as a safeguard.** Anything that does not exactly match the pattern is never deleted.
+- **The script can be edited during a run.** Its body is a function, read whole before it starts: changing or overwriting the file while a backup is in progress no longer feeds the running shell with fragments of the new content.
 
-The reasons behind them, the other technical choices, the validation procedure and the ShellCheck directives are in [HACKING.md](HACKING.md).
+The reasons behind them, the other technical choices, the validation procedure, the regression tests and the ShellCheck directives are in [HACKING.md](HACKING.md).
 
 ## Known limitations
 
@@ -826,11 +918,13 @@ The reasons behind them, the other technical choices, the validation procedure a
 They become immortal and will have to be purged by hand: `--orphans` will list them for you.  
 If you are planning a rename, clean up first, or accept that the history will be kept.
 
-**The script is specific to Debian-like distributions:** `dpkg` and `apt` are among the mandatory binaries, and the `date` calls rely on the GNU `-d` and `%-d` extensions.  
+**The script is specific to Debian-like distributions:** `dpkg`, `apt` and `apt-mark` are among the mandatory binaries, and the `date` calls rely on the GNU `-d` and `%-d` extensions.  
 Elsewhere, it will refuse to start until the configuration block and the package inventory have been adapted.
 
-**Tarsnap exit code 2 is not singled out:** Tarsnap uses it to report an error that occurred after the server-side state had already been modified.  
-`set -e` treats it like any other error.
+**The key of the host can delete every archive:** the rotation deletes, and deleting requires reading, so the key of the machine holds both rights. Whoever takes root on the machine can therefore destroy the whole history, and not only the archives that the rotation would purge.  
+Where that risk weighs more than an automatic rotation, the host can be given a key made with `tarsnap-keymgmt -w`, which creates archives but can neither list nor delete them, and the purge done from a trusted machine that holds the full key, `rotation-check.sh -H` telling which archives to delete. `tarsnap-backup.sh` does not cover that layout as it stands: with a write-only key, each run creates its archive, then fails on the listing.
+
+**One key per machine:** two machines sharing a key make each other fail, see [Tarsnap](#tarsnap).
 
 **Passphrase-protected key:** Tarsnap reads the key again on every invocation, and therefore needs the passphrase again, up to three times per run: creation, listing, purge.  
 With the default method or a `dev:` one, without the terminal that the method needs, under `cron` for example, the script stops before `prebackup`, with an explicit message: use `env:` or `file:` instead, see [Tarsnap](#tarsnap). A standard input that is not a terminal counts as no terminal: piping the passphrase in is not supported, since every invocation would read it again. To run the script through `ssh host command`, add `-t`.
@@ -840,7 +934,7 @@ With the default method or a `dev:` one, without the terminal that the method ne
 **The key of `tarsnap.conf` may stay unknown:** with `TARSNAP_KEY` empty, the script cannot tell which key Tarsnap will use when `tarsnap --dump-config` exits with a non-zero status (Tarsnap older than 1.0.40, invalid configuration), shows no `keyfile` line, or gives a path that starts with `~` or contains a blank. Tarsnap expands `~` from the password database, which the script does not read.  
 Only an `env:` or `file:` method is then checked, and a protected key asked on the terminal will only fail once `prebackup` has run. An unreadable key is treated in the same way, and left to Tarsnap, which names it in its own error message.
 
-**Tarsnap older than 1.0.40:** it knows neither `--passphrase` nor `--dump-config`, and the script does not check the version: with `TARSNAP_PASSPHRASE` set, a backup fails as soon as Tarsnap receives `--passphrase`, at the creation of the archive, after `prebackup` has run.
+**Tarsnap older than 1.0.40:** it knows neither `--passphrase`, nor `--dump-config`, nor `--no-progress-bytes`, and the script does not check the version: every run without `--verbose`, and every run with `TARSNAP_PASSPHRASE` set, fails at the creation of the archive, after `prebackup` has run.
 
 ## Restoring
 
@@ -851,12 +945,13 @@ Make a habit of checking, for example once a quarter:
 ```sh
 tarsnap --list-archives                                # pick an archive from the list
 tarsnap -tv -f hostname-YYYY-MM-DD_HH-MM-SS            # inspect its contents
-mkdir /tmp/restore && cd /tmp/restore                  # create a temporary directory for the restore
-tarsnap -x -f hostname-YYYY-MM-DD_HH-MM-SS etc/fstab   # restore only /etc/fstab from the snapshot, into the current directory
+R=$(mktemp -d) && cd "$R" && tarsnap -x -k -f hostname-YYYY-MM-DD_HH-MM-SS etc/fstab
 ```
 
+The last line restores `/etc/fstab` alone from the snapshot, into a new directory, and only once `cd` has succeeded: an extraction run from `/` after a failed `cd` would write over the file in place. `-k` keeps Tarsnap from overwriting a file that already exists. `mktemp` creates the directory in mode 0700: run as root, Tarsnap gives each file the mode it had in the archive, whatever the umask, and that directory keeps them out of reach of the other users.
+
 **Tarsnap strips the leading `/` from entry names (like `bsdtar`), so the paths to extract are relative: `etc/fstab`, not `/etc/fstab`.**  
-The restored file will therefore end up in `/tmp/restore/etc/fstab`: it will **NEVER** overwrite the original!
+The restored file therefore ends up in `$R/etc/fstab`, and the original is left alone.
 
 ## License
 
