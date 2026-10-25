@@ -287,6 +287,10 @@ MAX_PURGE=$(read_value MAX_PURGE)
 # would kill the script at the call site; as the last command of the
 # script, it would become its exit code. An if without else whose test
 # fails returns 0, wherever the line ends up.
+# Values of the file, kept for the simulation of a change to the values
+# given as options.
+FILE_DAILY=$DAILY; FILE_WEEKLY=$WEEKLY; FILE_MONTHLY=$MONTHLY
+FILE_DOW=$DOW; FILE_DOM=$DOM
 if [ -n "$OPT_DAILY" ];   then DAILY=$OPT_DAILY;     fi
 if [ -n "$OPT_WEEKLY" ];  then WEEKLY=$OPT_WEEKLY;   fi
 if [ -n "$OPT_MONTHLY" ]; then MONTHLY=$OPT_MONTHLY; fi
@@ -746,7 +750,11 @@ else
     done | "$DATE_BIN" -f - +%F > "$TMP_DIR/days"
     date_days "$TMP_DIR/days" "$TMP_DIR/dated"
 
-    while read -r f_unix w_key w_unix m_key m_unix; do
+    # The archives kept make the steady state, which the breaker checks
+    # below start from: what the rotation keeps when it runs every night.
+    while IFS= read -r day <&3 &&
+        read -r f_unix w_key w_unix m_key m_unix <&4; do
+        s_line="$day $f_unix $w_key $w_unix $m_key $m_unix"
         decide
         case "$DECISION" in
             son)     kd=$((kd + 1)) ;;
@@ -754,7 +762,10 @@ else
             gfather) km=$((km + 1)) ;;
             *)       del=$((del + 1)) ;;
         esac
-    done < "$TMP_DIR/dated"
+        if [ "$DECISION" != purge ]; then
+            printf '%s\n' "$s_line" >&6
+        fi
+    done 3< "$TMP_DIR/days" 4< "$TMP_DIR/dated" 6> "$TMP_DIR/steady"
     printf '\n'
 fi
 
@@ -859,6 +870,114 @@ else
         if [ "$DAYS" -le "$((WEEKLY_SEC / 86400))" ]; then
             printf '  %s simulated days do not reach its window, see -D.\n' \
                 "$DAYS"
+        fi
+    fi
+
+    # The breaker, MAX_PURGE, against the steady state, the archives kept
+    # above. A normal night first: the next nights, one run each at the
+    # time of day of now. Then a gap between two runs, from missed nights
+    # or from a clock ahead, which both make a run see the same archives
+    # older, by as many days (N-R2-3, N-R1-6). Last, when options change
+    # the retention values, the first run after the values of the file
+    # gave way to them, as for a reinstalled script whose retention went
+    # back to the defaults (N-R2-1).
+    printf '\nPurge circuit breaker, MAX_PURGE=%s:\n' "$MAX_PURGE"
+    RUN_TIME=$("$DATE_BIN" +%T)
+    FIRST=$("$DATE_BIN" -d "+1 days $TODAY 12:00" +%F)
+    project "$TMP_DIR/steady" "$FIRST" 62 "$RUN_TIME" "" ""
+    if [ "$P_OVER" -eq 0 ]; then
+        printf '  a normal night deletes at most %s, over 62 nights.\n' \
+            "$P_MAX"
+    else
+        printf '  the other normal nights delete at most %s.\n' "$P_MAX"
+    fi
+
+    STEADY=$((kd + kw + km))
+    if [ "$MAX_PURGE" -ge "$STEADY" ]; then
+        printf '  no gap between two runs can trip it: %s are kept.\n' \
+            "$STEADY"
+    else
+        # A run g_k days after the last one, ten years at most: past the
+        # monthly window, the rotation deletes every archive kept, more
+        # than MAX_PURGE.
+        i=1
+        while [ "$i" -le 3660 ]; do
+            printf '+%s days %s 12:00\n' "$i" "$TODAY"
+            i=$((i + 1))
+        done | "$DATE_BIN" -f - +%F > "$TMP_DIR/g_days"
+        "$SED_BIN" "s/\$/ $RUN_TIME/" "$TMP_DIR/g_days" |
+            "$DATE_BIN" -f - +%s > "$TMP_DIR/g_now"
+        bound_days "$TMP_DIR/g_days" "$TMP_DIR/g_bound"
+        s_now0=$NOW_UNIX
+        s_bound0=$MONTHLY_UNIX
+        g_k=0
+        g_prev=0
+        NIGHT_DEL=0
+        while read -r NOW_UNIX <&3 && read -r MONTHLY_UNIX <&4; do
+            g_k=$((g_k + 1))
+            run_night "$TMP_DIR/steady" "$TMP_DIR/g_kept" "$TMP_DIR/g_del"
+            if [ "$NIGHT_DEL" -gt "$MAX_PURGE" ]; then
+                break
+            fi
+            g_prev=$NIGHT_DEL
+        done 3< "$TMP_DIR/g_now" 4< "$TMP_DIR/g_bound"
+        NOW_UNIX=$s_now0
+        MONTHLY_UNIX=$s_bound0
+        if [ "$NIGHT_DEL" -le "$MAX_PURGE" ]; then
+            printf '  no gap of up to ten years between two runs trips it.\n'
+        elif [ "$g_k" -eq 1 ]; then
+            printf '  even the next normal run trips it: it deletes %s.\n' \
+                "$NIGHT_DEL"
+        else
+            printf '  it trips after %s missed night(s) in a row, or with a\n' \
+                "$((g_k - 1))"
+            printf '  clock %s day(s) ahead, deleting %s (%s a day less).\n' \
+                "$((g_k - 1))" "$NIGHT_DEL" "$g_prev"
+        fi
+    fi
+
+    if [ "$DAILY" != "$FILE_DAILY" ] || [ "$WEEKLY" != "$FILE_WEEKLY" ] ||
+        [ "$MONTHLY" != "$FILE_MONTHLY" ] || [ "$DOW" != "$FILE_DOW" ] ||
+        [ "$DOM" != "$FILE_DOM" ]; then
+        # The steady state of the values of the file, over the same
+        # history, then its archives dated and decided with the values
+        # given, at the same moment: the first run after the change.
+        e_daily=$DAILY; e_weekly=$WEEKLY; e_monthly=$MONTHLY
+        e_dow=$DOW; e_dom=$DOM
+        e_dsec=$DAILY_SEC; e_wsec=$WEEKLY_SEC; e_bound=$MONTHLY_UNIX
+        DAILY=$FILE_DAILY; WEEKLY=$FILE_WEEKLY; MONTHLY=$FILE_MONTHLY
+        DOW=$FILE_DOW; DOM=$FILE_DOM
+        DAILY_SEC=$((DAILY * 86400))
+        WEEKLY_SEC=$((DAILY_SEC + WEEKLY * 604800))
+        printf '%s\n' "$TODAY" > "$TMP_DIR/x_today"
+        bound_days "$TMP_DIR/x_today" "$TMP_DIR/x_bound"
+        read -r MONTHLY_UNIX < "$TMP_DIR/x_bound"
+        date_days "$TMP_DIR/days" "$TMP_DIR/x_dated"
+        SEEN_WEEKS=" "
+        SEEN_MONTHS=" "
+        while IFS= read -r day <&3 &&
+            read -r f_unix w_key w_unix m_key m_unix <&4; do
+            decide
+            if [ "$DECISION" != purge ]; then
+                printf '%s\n' "$day" >&6
+            fi
+        done 3< "$TMP_DIR/days" 4< "$TMP_DIR/x_dated" 6> "$TMP_DIR/x_days"
+
+        DAILY=$e_daily; WEEKLY=$e_weekly; MONTHLY=$e_monthly
+        DOW=$e_dow; DOM=$e_dom
+        DAILY_SEC=$e_dsec; WEEKLY_SEC=$e_wsec; MONTHLY_UNIX=$e_bound
+        date_days "$TMP_DIR/x_days" "$TMP_DIR/x_dated"
+        while IFS= read -r day <&3 && IFS= read -r x_vals <&4; do
+            printf '%s %s\n' "$day" "$x_vals"
+        done 3< "$TMP_DIR/x_days" 4< "$TMP_DIR/x_dated" > "$TMP_DIR/x_set"
+        run_night "$TMP_DIR/x_set" "$TMP_DIR/x_kept" "$TMP_DIR/x_del"
+        printf '  from the values of %s to these,\n' "$BACKUP_SCRIPT"
+        if [ "$NIGHT_DEL" -gt "$MAX_PURGE" ]; then
+            printf '  the first run would delete %s: it trips.\n' \
+                "$NIGHT_DEL"
+        else
+            printf '  the first run would delete %s, within MAX_PURGE.\n' \
+                "$NIGHT_DEL"
         fi
     fi
 fi
