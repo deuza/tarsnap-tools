@@ -21,7 +21,8 @@
 #           tarsnap --list-archives | ./rotation-check.sh -l -
 #       The archives are those of this machine, or of the host named by -H.
 #
-# The retention values are read directly from tarsnap-backup.sh.
+# The retention values are read directly from tarsnap-backup.sh, and so is
+# MAX_PURGE, the purge circuit breaker.
 #
 # The options make it possible to compare a scenario without changing
 # anything in that file.
@@ -55,6 +56,7 @@ OPT_WEEKLY=""
 OPT_MONTHLY=""
 OPT_DOW=""
 OPT_DOM=""
+OPT_MAX_PURGE=""  # breaker, set by -b
 OPT_HOST=""       # host of the replayed archives, set by -H
 HOST_SET=0
 
@@ -74,8 +76,9 @@ usage() {
         _rest=${_rest#?}
     done
     cat >&2 <<EOF
-usage: ${0##*/} [-h] [-D days] [-f script] [-d DAILY] [-w WEEKLY]
-$_pad [-m MONTHLY] [-o DOW] [-M DOM] [-l file|-] [-H host]
+usage: ${0##*/} [-h] [-D days] [-f script] [-l file|-] [-H host]
+$_pad [-d DAILY] [-w WEEKLY] [-m MONTHLY] [-o DOW] [-M DOM]
+$_pad [-b count]
 
   -D days     simulation horizon (default $DAYS)
   -f script   path of the tarsnap-backup.sh to read the configuration from
@@ -84,11 +87,12 @@ $_pad [-m MONTHLY] [-o DOW] [-M DOM] [-l file|-] [-H host]
   -m MONTHLY  override the monthly window, in months
   -o DOW      override the day of the week kept, 0=Sunday
   -M DOM      override the day of the month kept
+  -b count    override MAX_PURGE, the most archives a run may delete
   -l file     replay against a real list of archives, "-" for stdin
   -H host     host of the replayed archives, instead of this machine
   -h          display this help
 
-Without overrides, the five retention values are read from tarsnap-backup.sh.
+Without overrides, all six values are read from tarsnap-backup.sh.
 Search order: $BACKUP_SCRIPT_INSTALLED, then this script's directory.
 EOF
     exit "${1:-1}"
@@ -99,7 +103,7 @@ die() {
     exit 1
 }
 
-while getopts "D:f:d:w:m:o:M:l:H:h" opt; do
+while getopts "D:f:d:w:m:o:M:l:H:b:h" opt; do
     case "$opt" in
         D) DAYS=$OPTARG ;;
         f) BACKUP_SCRIPT=$OPTARG ;;
@@ -110,6 +114,7 @@ while getopts "D:f:d:w:m:o:M:l:H:h" opt; do
         M) OPT_DOM=$OPTARG ;;
         l) LISTFILE=$OPTARG ;;
         H) OPT_HOST=$OPTARG; HOST_SET=1 ;;
+        b) OPT_MAX_PURGE=$OPTARG ;;
         h) usage 0 ;;
         *) usage 1 ;;
     esac
@@ -241,17 +246,34 @@ check_retention() {
     return 0
 }
 
+# MAX_PURGE, refused under the same conditions as in tarsnap-backup.sh. The
+# function is a copy of the one in tarsnap-backup.sh and must stay
+# identical to it, byte for byte, see HACKING.md.
+check_max_purge() {
+    case "$MAX_PURGE" in
+        ""|*[!0123456789]*|0*|??????*)
+            die "MAX_PURGE must be a decimal integer from 1 to 99999," \
+                "without a leading zero" ;;
+    esac
+    return 0
+}
+
 DAILY=$(read_value DAILY)
 WEEKLY=$(read_value WEEKLY)
 MONTHLY=$(read_value MONTHLY)
 DOW=$(read_value DOW)
 DOM=$(read_value DOM)
+# The purge circuit breaker of tarsnap-backup.sh. A file without it stops
+# the tool, as any missing value: such a backup predates the rotation that
+# decide() replays, and would decide otherwise anyway.
+MAX_PURGE=$(read_value MAX_PURGE)
 
 # The values of the file are checked before the overrides, so that an
 # option cannot hide a value that the backup would refuse. Since
 # check_retention() must not change, it does not say where a value comes
 # from: it runs in a subshell, and a second line names the source.
 ( check_retention ) || die "value read from $BACKUP_SCRIPT"
+( check_max_purge ) || die "value read from $BACKUP_SCRIPT"
 
 # The overrides come after the reading, so that a scenario can be compared
 # with the real configuration without touching the script.
@@ -266,7 +288,9 @@ if [ -n "$OPT_WEEKLY" ];  then WEEKLY=$OPT_WEEKLY;   fi
 if [ -n "$OPT_MONTHLY" ]; then MONTHLY=$OPT_MONTHLY; fi
 if [ -n "$OPT_DOW" ];     then DOW=$OPT_DOW;         fi
 if [ -n "$OPT_DOM" ];     then DOM=$OPT_DOM;         fi
+if [ -n "$OPT_MAX_PURGE" ]; then MAX_PURGE=$OPT_MAX_PURGE; fi
 ( check_retention ) || die "value given on the command line"
+( check_max_purge ) || die "value given on the command line"
 
 # The simulated horizon follows the same rules, from 1 to 99999 days. It is
 # not a retention value and stays out of check_retention(), which must not
@@ -340,9 +364,11 @@ printf 'daily      DAILY=%-4s all              from %5s to %5s d\n' \
     "$DAILY" 0 "$((DAILY_SEC / 86400))"
 printf 'weekly     WEEKLY=%-3s DOW=%s            from %5s to %5s d\n' \
     "$WEEKLY" "$DOW" "$((DAILY_SEC / 86400))" "$((WEEKLY_SEC / 86400))"
-printf 'monthly    MONTHLY=%-2s DOM=%-2s           from %5s to %5s d\n\n' \
+printf 'monthly    MONTHLY=%-2s DOM=%-2s           from %5s to %5s d\n' \
     "$MONTHLY" "$DOM" "$((WEEKLY_SEC / 86400))" \
     "$(((NOW_UNIX - MONTHLY_UNIX) / 86400))"
+printf 'breaker    MAX_PURGE=%s, the most archives a run may delete\n\n' \
+    "$MAX_PURGE"
 
 # Invariant: each tier must open a window STRICTLY wider than the previous
 # one, otherwise its test is unreachable and the tier is useless.
@@ -630,6 +656,16 @@ if [ -n "$LISTFILE" ]; then
     # configuration disables is pointed out.
     if [ "$kw" -eq 0 ] && [ "$ANOMALIE" -eq 1 ]; then
         printf 'CONCLUSION: the father tier keeps nothing.\n'
+    fi
+    # A run at this very moment would delete the archives marked DELETED
+    # above. Past MAX_PURGE, the breaker of tarsnap-backup.sh stops it: the
+    # run deletes nothing and ends with an error.
+    if [ "$del" -gt "$MAX_PURGE" ]; then
+        printf 'CONCLUSION: a run now would delete %s archives, more than\n' \
+            "$del"
+        printf '  MAX_PURGE=%s: it would stop and delete nothing, unless\n' \
+            "$MAX_PURGE"
+        printf '  given --force-purge.\n'
     fi
 else
     # Simulation: the verdict rests on what each tier actually kept, and no

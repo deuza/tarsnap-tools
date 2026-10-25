@@ -621,6 +621,21 @@ check_retention() {
     return 0
 }
 
+# MAX_PURGE follows the rules of the retention values, from 1 to 99999: a
+# decimal integer without a leading zero, five digits at most, checked on
+# the text. 0 would stop every purge, which is the job of --dry-run, not
+# of a breaker; 99999 practically disables it.
+# To be kept identical, byte for byte, to the function of the same name in
+# rotation-check.sh, which reads MAX_PURGE to foresee the breaker.
+check_max_purge() {
+    case "$MAX_PURGE" in
+        ""|*[!0123456789]*|0*|??????*)
+            die "MAX_PURGE must be a decimal integer from 1 to 99999," \
+                "without a leading zero" ;;
+    esac
+    return 0
+}
+
 # Normalises BACKUP_DIRS in place. The trailing slashes are removed, then
 # every entry that tarsnap would store under another name than its
 # canonical path is refused: a relative path, "//", a "." or ".."
@@ -813,15 +828,8 @@ check_retention
 check_dirs
 check_excludes
 
-# MAX_PURGE follows the rules of the retention values, from 1 to 99999: a
-# decimal integer without a leading zero, five digits at most, checked on
-# the text. 0 would stop every purge, which is the job of --dry-run, not
-# of a breaker; 99999 practically disables it.
-case "$MAX_PURGE" in
-    ""|*[!0123456789]*|0*|??????*)
-        die "MAX_PURGE must be a decimal integer from 1 to 99999," \
-            "without a leading zero" ;;
-esac
+# MAX_PURGE, checked in every mode as well, see check_max_purge().
+check_max_purge
 
 # TARSNAP_KEY and TARSNAP_PASSPHRASE end up in TARSNAP_KEYOPT, expanded
 # unquoted so that the options vanish when empty (see below): a blank
