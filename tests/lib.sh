@@ -296,10 +296,14 @@ install_diff() {
 }
 
 # --- Running ---
-# Every run starts in $T, reads /dev/null as stdin, writes $T/out and
-# $T/err, and leaves its exit status in RC. The log of the stub starts
-# afresh with each run. SHELL_OPTS goes to the shell, -x for a trace.
+# Every run starts in $T, reads RUN_STDIN, /dev/null by default, writes
+# $T/out and $T/err, and leaves its exit status in RC. The log of the stub
+# starts afresh with each run. SHELL_OPTS goes to the shell, -x for a
+# trace. With RUN_PIDFILE set, the PID of the shell under test is written
+# there as it starts.
 SHELL_OPTS=""
+RUN_STDIN=/dev/null
+RUN_PIDFILE=""
 
 stub_reset() {
     rm -f "$S"/call.* "$S/calls" "$S/n"
@@ -312,6 +316,15 @@ run_script() {
     shift
     stub_reset
     RC=0
+    if [ -n "$RUN_PIDFILE" ]; then
+        # The single quotes keep $$ and $@ for the inner shell, which
+        # writes its own PID before it becomes the shell under test.
+        # shellcheck disable=SC2016
+        set -- /bin/sh -c 'printf "%s\n" "$$" > "$0"; exec "$@"' \
+            "$RUN_PIDFILE" "$_rs_script" "$@"
+        _rs_script=$1
+        shift
+    fi
     if [ -n "$FAKE_NOW" ]; then
         set_now "$FAKE_NOW"
         # The shell under test is a list of words: "busybox sh".
@@ -319,11 +332,11 @@ run_script() {
         (cd "$T" && exec env LD_PRELOAD="$FT_LIB" FAKETIME_SHARED="$FT_SHARED" \
             FAKETIME_TIMESTAMP_FILE="$T/faketime" FAKETIME_NO_CACHE=1 \
             $TEST_SHELL $SHELL_OPTS "$_rs_script" "$@") \
-            < /dev/null > "$T/out" 2> "$T/err" || RC=$?
+            < "$RUN_STDIN" > "$T/out" 2> "$T/err" || RC=$?
     else
         # shellcheck disable=SC2086
         (cd "$T" && exec $TEST_SHELL $SHELL_OPTS "$_rs_script" "$@") \
-            < /dev/null > "$T/out" 2> "$T/err" || RC=$?
+            < "$RUN_STDIN" > "$T/out" 2> "$T/err" || RC=$?
     fi
 }
 
@@ -340,11 +353,16 @@ run_diff() {
 }
 
 # tarsnap-stats.sh takes its tarsnap from TARSNAP and the rest from PATH:
-# it is copied as is.
-run_stats() {
+# it is copied as is, and TARSNAP names the stub, unless the case sets
+# STATS_TARSNAP.
+install_stats() {
     cp "$REPO_DIR/tarsnap-stats.sh" "$T/tarsnap-stats.sh"
     TARSNAP=${STATS_TARSNAP:-$T/bin/tarsnap}
     export TARSNAP
+}
+
+run_stats() {
+    install_stats
     run_script "$T/tarsnap-stats.sh" "$@"
 }
 
@@ -374,6 +392,24 @@ bg_wait() {
     wait "$BG_PID" || RC=$?
 }
 
+# bg_wait_max SECONDS: the same, for a run that a regression would block
+# forever: past that delay, a watchdog kills it and the case fails.
+bg_wait_max() {
+    rm -f "$T/watchdog.fired"
+    (
+        sleep "$1"
+        : > "$T/watchdog.fired"
+        kill -9 "$BG_PID"
+    ) > /dev/null 2>&1 &
+    _bw_dog=$!
+    bg_wait
+    kill "$_bw_dog" 2> /dev/null || :
+    wait "$_bw_dog" 2> /dev/null || :
+    if [ -f "$T/watchdog.fired" ]; then
+        fail "the run was still going after $1 s, killed"
+    fi
+}
+
 # In a pseudo-terminal, through script(1), in the background, without
 # faketime: run_pty SCRIPT ARGS. The terminal stays open three seconds
 # after the script ends, so that whatever it left behind can still draw
@@ -390,6 +426,30 @@ run_pty() {
 # Size of a file, in bytes.
 size_of() {
     wc -c < "$1" | tr -d ' '
+}
+
+# signal_at MODE SIG: during the next run, send SIG to the script as soon
+# as it calls the stub in that mode, then let the stub go on; signal_done
+# after the run. The run stays in the foreground: a background job starts
+# with SIGINT and SIGQUIT ignored, which a shell can no longer trap.
+signal_at() {
+    hold_on "$1"
+    (
+        (
+            sleep 30
+            printf 'timeout\n' > "$S/at.$1"
+        ) &
+        read -r _sa_pid < "$S/at.$1" || exit 0
+        [ "$_sa_pid" != timeout ] || exit 0
+        kill "-$2" "$_sa_pid"
+        printf 'go\n' > "$S/go.$1"
+    ) > /dev/null 2>&1 &
+    SIGNALLER=$!
+}
+
+signal_done() {
+    wait "$SIGNALLER" 2> /dev/null || :
+    rm -f "$S/at.$1" "$S/go.$1"
 }
 
 # --- Rendezvous with the stub ---
@@ -465,6 +525,16 @@ snapshot() {
         cp -a "$_sn_dir" "$S/store/$_sn_name/$_sn_rel"
         printf '%s\n' "$_sn_rel" >> "$S/store/$_sn_name.roots"
     done
+}
+
+# listing_of NAME: the listing that the stub generates for the archive
+# NAME, in UTC as tarsnap-diff.sh asks it, saved as its static listing
+# for the case to edit.
+listing_of() {
+    TZ=UTC0 "$T/bin/tarsnap" -tv -f "$1" > "$S/listing.tmp"
+    mv "$S/listing.tmp" "$S/listing/$1"
+    rm -f "$S"/call.* "$S/n"
+    : > "$S/calls"
 }
 
 # Detail lines of a log, without the header.
