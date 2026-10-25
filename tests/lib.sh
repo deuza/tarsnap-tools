@@ -111,6 +111,12 @@ t_init() {
     cp "$TESTS_DIR/stub/tarsnap" "$TESTS_DIR/stub/uname" \
         "$TESTS_DIR/stub/dpkg" "$TESTS_DIR/stub/apt" \
         "$TESTS_DIR/stub/apt-mark" "$T/bin/"
+    # A wrapper that writes its PID to $1, then execs the rest: the single
+    # quotes keep its $$, $1 and $@ for it.
+    # shellcheck disable=SC2016
+    printf '#!/bin/sh\nprintf "%%s\\n" "$$" > "$1"\nshift\nexec "$@"\n' \
+        > "$T/bin/pidwrap"
+    chmod +x "$T/bin/pidwrap"
     STUB_STATE_DIR="$T/stub"
     export STUB_STATE_DIR
     S=$STUB_STATE_DIR
@@ -316,14 +322,11 @@ run_script() {
     shift
     stub_reset
     RC=0
+    # pidwrap writes its PID, then execs the shell under test, which keeps
+    # it. No blank in the paths: the words split as they should.
+    _rs_wrap=""
     if [ -n "$RUN_PIDFILE" ]; then
-        # The single quotes keep $$ and $@ for the inner shell, which
-        # writes its own PID before it becomes the shell under test.
-        # shellcheck disable=SC2016
-        set -- /bin/sh -c 'printf "%s\n" "$$" > "$0"; exec "$@"' \
-            "$RUN_PIDFILE" "$_rs_script" "$@"
-        _rs_script=$1
-        shift
+        _rs_wrap="$T/bin/pidwrap $RUN_PIDFILE"
     fi
     if [ -n "$FAKE_NOW" ]; then
         set_now "$FAKE_NOW"
@@ -331,11 +334,11 @@ run_script() {
         # shellcheck disable=SC2086
         (cd "$T" && exec env LD_PRELOAD="$FT_LIB" FAKETIME_SHARED="$FT_SHARED" \
             FAKETIME_TIMESTAMP_FILE="$T/faketime" FAKETIME_NO_CACHE=1 \
-            $TEST_SHELL $SHELL_OPTS "$_rs_script" "$@") \
+            $_rs_wrap $TEST_SHELL $SHELL_OPTS "$_rs_script" "$@") \
             < "$RUN_STDIN" > "$T/out" 2> "$T/err" || RC=$?
     else
         # shellcheck disable=SC2086
-        (cd "$T" && exec $TEST_SHELL $SHELL_OPTS "$_rs_script" "$@") \
+        (cd "$T" && exec $_rs_wrap $TEST_SHELL $SHELL_OPTS "$_rs_script" "$@") \
             < "$RUN_STDIN" > "$T/out" 2> "$T/err" || RC=$?
     fi
 }

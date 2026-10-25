@@ -13,6 +13,10 @@
 # paths point into it, with a fake tarsnap. Neither the network nor an
 # account nor root is needed.
 #
+# Run it in the foreground. A background job starts with SIGINT and
+# SIGQUIT ignored, nohup ignores SIGHUP, and a shell cannot trap again a
+# signal ignored when it started: the cases about signals would fail.
+#
 # usage: tests/run.sh [-s] [-p] [-r] [-t TARSNAP] [-S SHELL] [-k] [CASE...]
 #
 #   -s          also run the slow checks of tests/slow: rotation-check.sh
