@@ -54,6 +54,7 @@ SED_BIN="/usr/bin/sed"
 SORT_BIN="/usr/bin/sort"
 DPKG_BIN="/usr/bin/dpkg"
 APT_BIN="/usr/bin/apt"
+APT_MARK_BIN="/usr/bin/apt-mark"
 FLOCK_BIN="/usr/bin/flock"
 CHMOD_BIN="/usr/bin/chmod"
 
@@ -100,7 +101,10 @@ TARSNAP_PASSPHRASE=""
 # is removed; a relative path, "//", a "." or ".." component and a
 # symbolic link are refused, see check_dirs(). A missing directory is not
 # refused: tarsnap reports it, and the run then ends with exit status 2.
-BACKUP_DIRS="/root /boot /etc"
+# /usr/local/sbin holds this script with its configuration: restored with
+# the rest, it brings back the retention values and the hooks, which a
+# copy reinstalled from the repository would not have.
+BACKUP_DIRS="/root /boot /etc /usr/local/sbin"
 
 # Exclusion patterns, space-separated. Two forms are accepted:
 #   - glob pattern ("*/tmp/*"), passed as is to tarsnap
@@ -119,9 +123,12 @@ BACKUP_EXCLUDE="*/tmp/* /var/www/html/APOD"
 # could be held by any local user, and block the backups.
 LOCK_FILE="/run/tarsnap-backup.lock"
 
-# Package inventory, regenerated before each backup
+# Package inventory, regenerated before each backup: the dpkg selections,
+# the list of apt, and the packages installed on purpose (apt-mark
+# showmanual), the list to hand to apt to rebuild the system.
 PKG_SELECTIONS="/root/pkg-selections.txt"
 PKG_LIST="/root/pkg-list.txt"
+PKG_MANUAL="/root/pkg-manual.txt"
 
 # --- Retention: grandfather / father / son scheme ---
 # The three windows are CUMULATIVE: they follow one another instead of
@@ -234,6 +241,13 @@ prebackup() {
         printf 'WARNING: apt list failed, incomplete list in %s:\n' \
             "$PKG_LIST" >&2
         printf '%s\n' "$_apt_err" >&2
+    fi
+    # The packages installed on purpose, the others having come in as
+    # their dependencies. A failure is reported as for apt list.
+    if ! _mark_err=$("$APT_MARK_BIN" showmanual 2>&1 >"$PKG_MANUAL"); then
+        printf 'WARNING: apt-mark failed, incomplete list in %s:\n' \
+            "$PKG_MANUAL" >&2
+        printf '%s\n' "$_mark_err" >&2
     fi
 
     # Examples to uncomment and adapt. Declare the absolute path of the
@@ -766,7 +780,7 @@ fi
 # All the configured binaries must be executable.
 for bin in "$TARSNAP_BIN" "$DATE_BIN" "$UNAME_BIN" "$LOCALE_BIN" \
            "$GREP_BIN" "$SED_BIN" "$SORT_BIN" "$DPKG_BIN" "$APT_BIN" \
-           "$FLOCK_BIN" "$CHMOD_BIN"; do
+           "$FLOCK_BIN" "$CHMOD_BIN" "$APT_MARK_BIN"; do
     [ -x "$bin" ] || die "binary missing or not executable: $bin"
 done
 
