@@ -20,8 +20,8 @@
 # usage: tests/run.sh [-s] [-p] [-r] [-t TARSNAP] [-S SHELL] [-k] [CASE...]
 #
 #   -s          also run the slow checks of tests/slow: rotation-check.sh
-#               against the backup replayed night after night, a few
-#               minutes per shell
+#               against the backup, on five years of archives and
+#               replayed night after night, several minutes per shell
 #   -p          also run the checks that need a terminal: the progress
 #               line of tarsnap-stats.sh and tarsnap-diff.sh, through
 #               script(1), and timing-dependent
