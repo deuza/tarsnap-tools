@@ -9,8 +9,10 @@
 . "$TESTS_DIR/lib.sh"
 t_init
 install_backup
+# Daily archives up to yesterday: the newest one raises no warning about
+# the clock, and stderr must stay empty.
 {
-    days www 2026-06-01 5 00-02-02
+    days www 2026-06-05 5 00-02-02
     printf '%s\n' www-2020-01-07_00-02-02 www-2020-01-08_00-02-02 \
         www-2020-01-09_00-02-02
 } | set_archives

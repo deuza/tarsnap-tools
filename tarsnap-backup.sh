@@ -157,9 +157,9 @@ DOM=1       # first day of the months, from 1 to 31
 # moved forward makes the purge delete about one archive per day of shift:
 # 7 lets a week of missed nights through, and stops a clock that jumped
 # more than about a week ahead, retention values cut by mistake, or a
-# reinstalled script whose retention went back to the defaults. Nothing
-# else checks the clock: the script never compares it with the dates of
-# the archives.
+# reinstalled script whose retention went back to the defaults. Besides,
+# the rotation warns without stopping when the newest archive is dated
+# after today, or is two days old or more, as rotation-check.sh does.
 # Decimal integer from 1 to 99999, without a leading zero.
 MAX_PURGE=7
 
@@ -1317,6 +1317,7 @@ SEEN_MONTHS=" "
 # form and be passed to tarsnap -d. The list is fed by a here-document and
 # not by a pipe, so that the loop runs in the current shell and the -f
 # options it accumulates in "$@" survive it.
+NEWEST=""
 while IFS= read -r archive; do
     # Empty line: the account holds no archive at all.
     [ -n "$archive" ] || continue
@@ -1379,6 +1380,11 @@ while IFS= read -r archive; do
         continue
     fi
     f_unix=$((f_noon - 43200))
+    # The newest archive of the strict form before this run, for the
+    # warnings about the clock that follow the loop: the list goes oldest
+    # first.
+    NEWEST=$archive
+    NEWEST_UNIX=$f_unix
     f_dow=$("$DATE_BIN" -d "$day 12:00" +%w)
     # %-d: no leading zero, hence no octal.
     f_dom=$("$DATE_BIN" -d "$day 12:00" +%-d)
@@ -1463,6 +1469,29 @@ while IFS= read -r archive; do
 done <<_END_OF_ARCHIVE_LIST_
 $ARCHIVES
 _END_OF_ARCHIVE_LIST_
+
+# The clock, as rotation-check.sh reads it in a replay (N-R1-6). An archive
+# dated after today comes from a clock ahead, here or on the machine that
+# made it. A newest archive two days old or more, before this run, tells
+# of missed nights or of a clock now ahead: this run applies their rotation
+# at once, within MAX_PURGE. Warnings only, day counts at noon, as above.
+if [ -n "$NEWEST" ]; then
+    TODAY=$("$DATE_BIN" +%F)
+    TODAY_UNIX=$(($("$DATE_BIN" -d "$TODAY 12:00" +%s) - 43200))
+    if [ "$NEWEST_UNIX" -gt "$TODAY_UNIX" ]; then
+        printf 'WARNING: the newest archive, %s, is dated after today:\n' \
+            "$NEWEST" >&2
+        printf '  check the clocks, here and where it was made.\n' >&2
+    else
+        GAP=$(( (TODAY_UNIX - NEWEST_UNIX + 43200) / 86400 ))
+        if [ "$GAP" -ge 2 ]; then
+            printf 'WARNING: the newest archive, %s, is %s days old:\n' \
+                "$NEWEST" "$GAP" >&2
+            printf '  missed nights, or a clock ahead: this run applies\n' >&2
+            printf '  their rotation at once.\n' >&2
+        fi
+    fi
+fi
 
 # Two parameters per archive (-f and the name).
 COUNT=$(($# / 2))

@@ -2,8 +2,9 @@
 #
 # N-R1-6: a clock moved ahead made the next run purge in a single call
 # about one archive per day of shift. The purge circuit breaker stops it;
-# rotation-check.sh warns of an archive dated after today, and tells after
-# how many days ahead the next run would trip the breaker.
+# both scripts warn of an archive dated after today, and of a newest
+# archive two days old or more; rotation-check.sh tells after how many
+# days ahead the next run would trip the breaker.
 
 # shellcheck source=tests/lib.sh
 . "$TESTS_DIR/lib.sh"
@@ -15,6 +16,20 @@ set_archives < "$T/list"
 run_backup
 expect_rc 0 "clock right"
 expect_calls d 0
+reject_err "WARNING: the newest archive"
+
+days www 2026-03-13 87 00-02-02 | set_archives
+run_backup
+expect_rc 0 "three days without a run"
+expect_err "WARNING: the newest archive, www-2026-06-07_00-02-02, is 3 days old:"
+
+{
+    cat "$T/list"
+    printf 'www-2026-06-12_00-02-02\n'
+} | set_archives
+run_backup
+expect_rc 0 "archive dated after today"
+expect_err "WARNING: the newest archive, www-2026-06-12_00-02-02, is dated after today:"
 
 set_archives < "$T/list"
 FAKE_NOW="2026-08-10 12:00:00"
