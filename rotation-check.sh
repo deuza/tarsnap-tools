@@ -20,6 +20,8 @@
 #       file or from standard input:
 #           tarsnap --list-archives | ./rotation-check.sh -l -
 #       The archives are those of this machine, or of the host named by -H.
+#       The nights to come are then projected, to tell those where the
+#       breaker of tarsnap-backup.sh, MAX_PURGE, would stop the purge.
 #
 # The retention values are read directly from tarsnap-backup.sh, and so is
 # MAX_PURGE, the purge circuit breaker.
@@ -46,6 +48,7 @@ SORT_BIN="/usr/bin/sort"
 BACKUP_SCRIPT_INSTALLED="/usr/local/sbin/tarsnap-backup.sh"
 
 DAYS=1825         # simulated horizon, 5 years
+DAYS_SET=0        # 1 = -D given, which also sets the nights projected
 LISTFILE=""       # non-empty = replay mode
 BACKUP_SCRIPT=""  # non-empty = path forced by -f
 
@@ -80,7 +83,8 @@ usage: ${0##*/} [-h] [-D days] [-f script] [-l file|-] [-H host]
 $_pad [-d DAILY] [-w WEEKLY] [-m MONTHLY] [-o DOW] [-M DOM]
 $_pad [-b count]
 
-  -D days     simulation horizon (default $DAYS)
+  -D days     simulation horizon (default $DAYS), or nights projected after
+              a replay (default DAILY + 1)
   -f script   path of the tarsnap-backup.sh to read the configuration from
   -d DAILY    override the daily window, in days
   -w WEEKLY   override the weekly window, in weeks
@@ -105,7 +109,7 @@ die() {
 
 while getopts "D:f:d:w:m:o:M:l:H:b:h" opt; do
     case "$opt" in
-        D) DAYS=$OPTARG ;;
+        D) DAYS=$OPTARG; DAYS_SET=1 ;;
         f) BACKUP_SCRIPT=$OPTARG ;;
         d) OPT_DAILY=$OPTARG ;;
         w) OPT_WEEKLY=$OPTARG ;;
@@ -487,6 +491,130 @@ print_verdict() {
     printf '  %s %s\n' "$_name" "$2"
 }
 
+# Dates that decide() needs, for a list of days, with the date expressions
+# of tarsnap-backup.sh and of the replay, in a few calls to date, each fed
+# one expression per line: archive by archive, five years would take some
+# 9000 forks, and the tool looked as if it had hung at 7300. Reads the
+# days, YYYY-MM-DD one per line, from "$1", and writes to "$2" one line
+# per day, in the same order: "f_unix w_key w_unix m_key m_unix".
+date_days() {
+    # Noon of each day: epoch and day of the week.
+    "$SED_BIN" 's/$/ 12:00/' "$1" |
+        "$DATE_BIN" -f - '+%s %w' > "$TMP_DIR/noon"
+
+    # Two lines per day: the first day of its week, then the day that
+    # names its month, DOM - 1 days earlier.
+    while IFS= read -r day <&3 && read -r f_noon f_dow <&4; do
+        w_back=$(( (f_dow - DOW + 7) % 7 ))
+        printf -- '-%s days %s 12:00\n' "$w_back" "$day"
+        printf -- '-%s days %s 12:00\n' "$((DOM - 1))" "$day"
+    done 3< "$1" 4< "$TMP_DIR/noon" |
+        "$DATE_BIN" -f - '+%F %s %Y-%m' > "$TMP_DIR/periods"
+
+    # First day of each of those months.
+    while read -r _ && read -r _ _ m_key; do
+        printf '+%s days %s-01 12:00\n' "$((DOM - 1))" "$m_key"
+    done < "$TMP_DIR/periods" | "$DATE_BIN" -f - +%s > "$TMP_DIR/months"
+
+    while read -r f_noon _ <&3 && read -r w_key w_epoch _ <&4 &&
+        read -r _ _ m_key <&4 && read -r m_ref <&5; do
+        printf '%s %s %s %s %s\n' "$((f_noon - 43200))" "$w_key" \
+            "$((w_epoch - 43200))" "$m_key" "$((m_ref - 43200))"
+    done 3< "$TMP_DIR/noon" 4< "$TMP_DIR/periods" \
+        5< "$TMP_DIR/months" > "$2"
+}
+
+# Monthly bound of a run made on each day of a list: the bound block above,
+# expression for expression, the day of the run standing for today. Reads
+# the days from "$1", writes one MONTHLY_UNIX per line to "$2".
+bound_days() {
+    "$SED_BIN" 's/$/ 12:00/' "$1" |
+        "$DATE_BIN" -f - '+%-d %Y-%m-15' > "$TMP_DIR/b_today"
+    while read -r _ b_ym; do
+        printf '%s 12:00 %s months ago\n' "$b_ym" "$MONTHLY"
+    done < "$TMP_DIR/b_today" | "$DATE_BIN" -f - +%Y-%m > "$TMP_DIR/b_ym"
+    "$SED_BIN" 's/$/-15 12:00 1 month/' "$TMP_DIR/b_ym" |
+        "$DATE_BIN" -f - +%Y-%m-01 | "$SED_BIN" 's/$/ 12:00 1 day ago/' |
+        "$DATE_BIN" -f - +%-d > "$TMP_DIR/b_last"
+    while read -r b_day _ <&3 && read -r b_ym <&4 && read -r b_last <&5; do
+        if [ "$b_day" -gt "$b_last" ]; then
+            b_day=$b_last
+        fi
+        printf '%s-%s 12:00\n' "$b_ym" "$b_day"
+    done 3< "$TMP_DIR/b_today" 4< "$TMP_DIR/b_ym" 5< "$TMP_DIR/b_last" |
+        "$DATE_BIN" -f - +%s > "$TMP_DIR/b_noon"
+    while read -r b_unix; do
+        printf '%s\n' "$((b_unix - WEEKLY_SEC))"
+    done < "$TMP_DIR/b_noon" > "$2"
+}
+
+# One run of tarsnap-backup.sh, at NOW_UNIX and with MONTHLY_UNIX already
+# set: decide() on every archive of the set "$1", whose lines read "name
+# f_unix w_key w_unix m_key m_unix", oldest first. The kept lines go to
+# "$2", the names of the deleted archives to "$3", their number to
+# NIGHT_DEL.
+run_night() {
+    SEEN_WEEKS=" "
+    SEEN_MONTHS=" "
+    NIGHT_DEL=0
+    while read -r p_name f_unix w_key w_unix m_key m_unix; do
+        p_line="$p_name $f_unix $w_key $w_unix $m_key $m_unix"
+        decide
+        if [ "$DECISION" = purge ]; then
+            NIGHT_DEL=$((NIGHT_DEL + 1))
+            printf '%s\n' "$p_name" >&7
+        else
+            printf '%s\n' "$p_line" >&6
+        fi
+    done < "$1" 6> "$2" 7> "$3"
+}
+
+# Projects runs of tarsnap-backup.sh, night after night, from the set "$1":
+# a run decides the set as the backup would, its deleted archives leave
+# the set, and the archive of the night joins it, which no run deletes the
+# night it is made. A night past MAX_PURGE is reported with its archives,
+# then counted as purged once with --force-purge, so that each burst shows
+# on its own. $2: first night, YYYY-MM-DD; $3: number of nights; $4: time
+# of the runs, HH:MM:SS; $5 and $6: what comes before and after the day in
+# the names of the new archives. Sets P_MAX, the most archives deleted by
+# one of the other nights, and P_OVER, the number of nights past
+# MAX_PURGE. NOW_UNIX and MONTHLY_UNIX are restored on return.
+project() {
+    p_now0=$NOW_UNIX
+    p_bound0=$MONTHLY_UNIX
+    i=0
+    while [ "$i" -lt "$3" ]; do
+        printf '+%s days %s 12:00\n' "$i" "$2"
+        i=$((i + 1))
+    done | "$DATE_BIN" -f - +%F > "$TMP_DIR/p_days"
+    "$SED_BIN" "s/\$/ $4/" "$TMP_DIR/p_days" |
+        "$DATE_BIN" -f - +%s > "$TMP_DIR/p_now"
+    bound_days "$TMP_DIR/p_days" "$TMP_DIR/p_bound"
+    date_days "$TMP_DIR/p_days" "$TMP_DIR/p_new"
+    "$CAT_BIN" "$1" > "$TMP_DIR/p_set"
+    P_MAX=0
+    P_OVER=0
+    while IFS= read -r p_day <&3 && read -r NOW_UNIX <&4 &&
+        read -r MONTHLY_UNIX <&5 && IFS= read -r p_new <&8; do
+        run_night "$TMP_DIR/p_set" "$TMP_DIR/p_kept" "$TMP_DIR/p_del"
+        if [ "$NIGHT_DEL" -gt "$MAX_PURGE" ]; then
+            P_OVER=$((P_OVER + 1))
+            printf '  %s  %s archives to delete, more than MAX_PURGE=%s\n' \
+                "$p_day" "$NIGHT_DEL" "$MAX_PURGE"
+            while IFS= read -r p_name; do
+                printf '              %s\n' "$p_name"
+            done < "$TMP_DIR/p_del"
+        elif [ "$NIGHT_DEL" -gt "$P_MAX" ]; then
+            P_MAX=$NIGHT_DEL
+        fi
+        "$CAT_BIN" "$TMP_DIR/p_kept" > "$TMP_DIR/p_set"
+        printf '%s%s%s %s\n' "$5" "$p_day" "$6" "$p_new" >> "$TMP_DIR/p_set"
+    done 3< "$TMP_DIR/p_days" 4< "$TMP_DIR/p_now" 5< "$TMP_DIR/p_bound" \
+        8< "$TMP_DIR/p_new"
+    NOW_UNIX=$p_now0
+    MONTHLY_UNIX=$p_bound0
+}
+
 kd=0; kw=0; km=0; del=0; skip=0
 
 # Weeks and months already represented, as " key key ... ": in both modes
@@ -527,6 +655,10 @@ if [ -n "$LISTFILE" ]; then
     done < "$TMP"
 
     printf 'Replay against the real list, hostname "%s":\n\n' "$COMPUTER"
+
+    : > "$TMP_DIR/dated"
+    NEWEST=""
+    NEWEST_UNIX=0
 
     # One archive per line, read whole, as in tarsnap-backup.sh: blanks at
     # either end belong to the name and keep it outside the pattern, where
@@ -570,6 +702,13 @@ if [ -n "$LISTFILE" ]; then
         m_key=$("$DATE_BIN" -d "-$((DOM - 1)) days $day 12:00" +%Y-%m)
         m_ref=$("$DATE_BIN" -d "+$((DOM - 1)) days ${m_key}-01 12:00" +%s)
         m_unix=$((m_ref - 43200))
+        # Kept for the projection of the nights to come, before decide()
+        # drops the month of an archive older than the monthly bound. The
+        # list being sorted, the last one is the newest.
+        printf '%s %s %s %s %s %s\n' "$archive" "$f_unix" "$w_key" \
+            "$w_unix" "$m_key" "$m_unix" >> "$TMP_DIR/dated"
+        NEWEST=$archive
+        NEWEST_UNIX=$f_unix
         decide
 
         case "$DECISION" in
@@ -587,11 +726,9 @@ else
     ###########################################################################
     printf 'Simulation over %s days, one archive per day...\n' "$DAYS"
 
-    # The dates of the whole history come from a few calls to date, each
-    # fed one expression per line: archive by archive, as in the replay,
-    # five years would take some 9000 forks, and the tool already looked as
-    # if it had hung at 7300. The expressions are those of the replay and
-    # of tarsnap-backup.sh, and the decision is the same function.
+    # The dates of the whole history come from date_days(), in a few calls
+    # to date, with the expressions of the replay and of tarsnap-backup.sh,
+    # and the decision is the same function.
     #
     # The days of the history come oldest first, as the backup sees them
     # after its sort, and are counted from noon of today: "-N days" from
@@ -607,30 +744,9 @@ else
         i=$((i - 1))
         printf '%s 12:00 %s days ago\n' "$TODAY" "$i"
     done | "$DATE_BIN" -f - +%F > "$TMP_DIR/days"
+    date_days "$TMP_DIR/days" "$TMP_DIR/dated"
 
-    # Noon of each day: epoch and day of the week.
-    "$SED_BIN" 's/$/ 12:00/' "$TMP_DIR/days" |
-        "$DATE_BIN" -f - '+%s %w' > "$TMP_DIR/noon"
-
-    # Two lines per day: the first day of its week, then the day that
-    # names its month, DOM - 1 days earlier.
-    while IFS= read -r day <&3 && read -r f_noon f_dow <&4; do
-        w_back=$(( (f_dow - DOW + 7) % 7 ))
-        printf -- '-%s days %s 12:00\n' "$w_back" "$day"
-        printf -- '-%s days %s 12:00\n' "$((DOM - 1))" "$day"
-    done 3< "$TMP_DIR/days" 4< "$TMP_DIR/noon" |
-        "$DATE_BIN" -f - '+%F %s %Y-%m' > "$TMP_DIR/periods"
-
-    # First day of each of those months.
-    while read -r _ && read -r _ _ m_key; do
-        printf '+%s days %s-01 12:00\n' "$((DOM - 1))" "$m_key"
-    done < "$TMP_DIR/periods" | "$DATE_BIN" -f - +%s > "$TMP_DIR/months"
-
-    while read -r f_noon f_dow <&3 && read -r w_key w_epoch _ <&4 &&
-        read -r _ _ m_key <&4 && read -r m_ref <&5; do
-        f_unix=$((f_noon - 43200))
-        w_unix=$((w_epoch - 43200))
-        m_unix=$((m_ref - 43200))
+    while read -r f_unix w_key w_unix m_key m_unix; do
         decide
         case "$DECISION" in
             son)     kd=$((kd + 1)) ;;
@@ -638,7 +754,7 @@ else
             gfather) km=$((km + 1)) ;;
             *)       del=$((del + 1)) ;;
         esac
-    done 3< "$TMP_DIR/noon" 4< "$TMP_DIR/periods" 5< "$TMP_DIR/months"
+    done < "$TMP_DIR/dated"
     printf '\n'
 fi
 
@@ -666,6 +782,60 @@ if [ -n "$LISTFILE" ]; then
         printf '  MAX_PURGE=%s: it would stop and delete nothing, unless\n' \
             "$MAX_PURGE"
         printf '  given --force-purge.\n'
+    fi
+
+    if [ -n "$NEWEST" ]; then
+        TODAY=$("$DATE_BIN" +%F)
+        TODAY_UNIX=$(($("$DATE_BIN" -d "$TODAY 12:00" +%s) - 43200))
+        # The clock, and the cron. An archive dated after today comes from
+        # a clock ahead, here or on the machine that made it: the breaker
+        # exists for such a clock (N-R1-6). A newest archive two days old
+        # or more tells of missed nights, whose rotation the next run
+        # applies at once (N-R2-3). Day counts at noon, as decide() does.
+        if [ "$NEWEST_UNIX" -gt "$TODAY_UNIX" ]; then
+            printf 'WARNING: the newest archive, %s, is dated after today:\n' \
+                "$NEWEST"
+            printf '  check the clocks, here and where it was made.\n'
+        else
+            GAP=$(( (TODAY_UNIX - NEWEST_UNIX + 43200) / 86400 ))
+            if [ "$GAP" -ge 2 ]; then
+                printf 'WARNING: the newest archive, %s, is %s days old:\n' \
+                    "$NEWEST" "$GAP"
+                printf '  the next run applies the missed nights at once.\n'
+            fi
+        fi
+
+        # The nights to come, from the next run at the time of day of the
+        # newest archive, which is the time cron runs the backup.
+        # Assumptions, as tarsnap-backup.sh would meet them: one run a
+        # night, no manual run, the same configuration. By default, the
+        # projection lasts until every archive of the list has left the
+        # daily window, where the bursts come from: archives made the same
+        # day leave it together.
+        RUN_STAMP=${NEWEST##*_}
+        RUN_TIME=$(printf '%s\n' "$RUN_STAMP" | "$SED_BIN" 's/-/:/g')
+        FIRST=$TODAY
+        RUN_UNIX=$("$DATE_BIN" -d "$TODAY $RUN_TIME" +%s)
+        if [ "$RUN_UNIX" -le "$NOW_UNIX" ]; then
+            FIRST=$("$DATE_BIN" -d "+1 days $TODAY 12:00" +%F)
+        fi
+        if [ "$DAYS_SET" -eq 1 ]; then
+            NIGHTS=$DAYS
+        else
+            NIGHTS=$((DAILY + 1))
+        fi
+        printf '\nNext %s nights, one run a night at %s, from %s:\n' \
+            "$NIGHTS" "$RUN_TIME" "$FIRST"
+        project "$TMP_DIR/dated" "$FIRST" "$NIGHTS" "$RUN_TIME" \
+            "${COMPUTER}-" "_$RUN_STAMP"
+        if [ "$P_OVER" -eq 0 ]; then
+            printf '  no night deletes more than MAX_PURGE=%s, at most %s.\n' \
+                "$MAX_PURGE" "$P_MAX"
+        else
+            printf '  the other nights delete at most %s. Each night above\n' \
+                "$P_MAX"
+            printf '  is counted as purged once, with --force-purge.\n'
+        fi
     fi
 else
     # Simulation: the verdict rests on what each tier actually kept, and no
