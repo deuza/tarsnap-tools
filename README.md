@@ -600,9 +600,9 @@ Each name is shown with its control characters neutralised, every byte outside p
 ## Checking your retention configuration
 
 The repository includes the `rotation-check.sh` script, which replays the decision logic of the rotation. It touches neither Tarsnap, nor the network, nor any archive.  
-The retention values are taken from the `tarsnap-backup.sh` file.
+The retention values and `MAX_PURGE` are taken from the `tarsnap-backup.sh` file, and checked under the same rules: a value that the backup would refuse stops the tool as well, with the same message.
 
-The search order is `/usr/local/sbin/tarsnap-backup.sh`, then, failing that, a `tarsnap-backup.sh` next to the script, in its own directory (which covers the case of a freshly cloned repository).
+The search order is `/usr/local/sbin/tarsnap-backup.sh`, then, failing that, a `tarsnap-backup.sh` next to the script, in its own directory (which covers the case of a freshly cloned repository). An installed copy that exists but cannot be read stops the tool, rather than letting it fall back on the copy of the repository.
 
 The `-f` option bypasses both.  
 The file is never sourced by the script, only read: sourcing it would trigger its option parsing, its lock and, in the end, a real backup.
@@ -621,13 +621,14 @@ Compare another setting without modifying anything:
 ./rotation-check.sh -d 30 -w 26 -m 60
 ```
 
-Replay the decision on your **real** archives:
+Replay the decision on your **real** archives, those of this machine, or those of the host named by `-H` for a list fetched elsewhere:
 
 ```sh
 tarsnap --list-archives | ./rotation-check.sh -l -
+./rotation-check.sh -l archives.txt -H www
 ```
 
-The output starts with where the configuration comes from and the three ranges, followed by the counters shown [above](#what-it-looks-like-in-practice):
+The output starts with where the configuration comes from, the three ranges and the breaker, followed by the counters shown [above](#what-it-looks-like-in-practice):
 
 ```
 tarsnap-backup: rotation consistency check
@@ -637,46 +638,89 @@ configuration read from /usr/local/sbin/tarsnap-backup.sh
 daily      DAILY=90   all              from     0 to    90 d
 weekly     WEEKLY=12  DOW=1            from    90 to   174 d
 monthly    MONTHLY=48 DOM=1            from   174 to  1635 d
+breaker    MAX_PURGE=7, the most archives a run may delete
 ```
 
-In replay mode, the archives are sorted by name, hence by host and then by date, and each one gets its verdict:
+A simulation then checks the breaker against the steady state, what the rotation keeps when it runs every night: the most archives a normal night deletes, then how many missed nights in a row, or how many days of a clock ahead, make a run delete more than `MAX_PURGE`. When options change the retention values, it also tells what the first run after the change would delete, as for a reinstalled script whose retention went back to the defaults. The second command above, on 25 October 2026:
 
 ```
-Replay against the real list, hostname "foo":
-
-  foo-2026-01-10_03-00-00_before-prod outside the pattern, untouchable
-  foo-2026-03-01_00-02-01             KEPT  (grandfather, monthly)
-  foo-2026-03-02_00-02-01             DELETED
-  foo-2026-06-01_00-02-02             KEPT  (father, weekly)
-  foo-2026-10-20_00-02-01.part        PARTIAL, left in place
-  foo-2026-10-21_00-02-01             KEPT  (son, daily)
+Purge circuit breaker, MAX_PURGE=7:
+  a normal night deletes at most 1, over 62 nights.
+  it trips after 8 missed night(s) in a row, or with a
+  clock 8 day(s) ahead, deleting 8 (7 a day less).
+  from the values of /usr/local/sbin/tarsnap-backup.sh to these,
+  the first run would delete 50: it trips.
 ```
+
+In replay mode, the archives are sorted by name, hence by host and then by date, and each one gets its verdict. Here, the real list of the author's machine, `www`, on 25 October 2026, shortened:
+
+```
+Replay against the real list, hostname "www":
+
+  www-2026-07-27_00-02-05             KEPT  (father, weekly)
+  www-2026-08-01_00-02-03             KEPT  (son, daily)
+  [...]
+  www-2026-09-14_00-02-02             KEPT  (son, daily)
+  www-2026-09-14_03-32-44_MUST_DELETE outside the pattern, untouchable
+  www-2026-09-15_00-02-02             KEPT  (son, daily)
+  [...]
+  www-2026-10-25_00-02-02             KEPT  (son, daily)
+
+  son         (daily)    : 100
+  father      (weekly)   : 1
+  grandfather (monthly)  : 0
+  deleted                : 0
+  outside the rotation   : 1
+  ----------------------------------
+  kept in total          : 101
+
+
+Next 91 nights, one run a night at 00:02:02, from 2026-10-26:
+  2026-12-04  10 archives to delete, more than MAX_PURGE=7
+              www-2026-09-05_00-02-03
+              www-2026-09-05_01-19-08
+              [...]
+              www-2026-09-05_03-08-38
+  2026-12-12  9 archives to delete, more than MAX_PURGE=7
+              www-2026-09-13_00-02-03
+              [...]
+              www-2026-09-13_19-24-08
+  the other nights delete at most 2. Each night above
+  is counted as purged once, with --force-purge.
+```
+
+A conclusion follows the counters when a run now would delete more than `MAX_PURGE`. Then a replay looks at the newest archive, as the backup does before purging: dated after today, or two days old or more, it gives the same warnings, see [Monitoring the backups](#monitoring-the-backups). Last, it projects the nights to come, one run a night at the time of day of the newest archive, with the same configuration and no run by hand, and lists the nights on which the breaker would stop the purge, with their archives. By default, it projects `DAILY` + 1 nights, long enough for every archive of the list to leave the daily window.  
+Above, the runs made by hand on 5 and 13 September leave it together, 90 days later: those two nights, the run will stop, and each time the purge will have to be reviewed with `--dry-run --verbose`, then run once with `--force-purge`.
 
 The options:
 
 | Option | Effect |
 |---|---|
-| `-D days` | simulation horizon, 1825 days by default |
+| `-D days` | simulation horizon, 1825 days by default, or nights projected after a replay, `DAILY` + 1 by default |
 | `-f script` | path of the `tarsnap-backup.sh` to read |
 | `-d DAILY` | overrides the daily window, in days |
 | `-w WEEKLY` | overrides the weekly window, in weeks |
 | `-m MONTHLY` | overrides the monthly window, in months |
-| `-o DOW` | overrides the day of the week kept, 0 = Sunday |
-| `-M DOM` | overrides the day of the month kept |
+| `-o DOW` | overrides the first day of the weeks, 0 = Sunday |
+| `-M DOM` | overrides the first day of the months |
+| `-b count` | overrides `MAX_PURGE` |
 | `-l file` | replays the decision against a list of archives, `-` for standard input |
+| `-H host` | host of the replayed archives, instead of this machine, with `-l` only |
 | `-h` | displays the help |
+
+Without overrides, all six values are read from `tarsnap-backup.sh`. The values given as options go through the same checks as those of the file, and an operand is refused, as in the backup.
 
 ## Comparing a snapshot with the system
 
 The repository also includes the `tarsnap-diff.sh` script, which compares a Tarsnap snapshot with the current state of the machine and tells you what has changed since.
 
-It sticks to the scope actually backed up: `BACKUP_DIRS`, `BACKUP_EXCLUDE`, `TARSNAP_KEY` and `TARSNAP_PASSPHRASE` are read from `tarsnap-backup.sh`, with the same search order as `rotation-check.sh` and the same precaution: the file is never sourced.  
+It sticks to the scope actually backed up: `BACKUP_DIRS`, `BACKUP_EXCLUDE`, `TARSNAP_KEY` and `TARSNAP_PASSPHRASE` are read from `tarsnap-backup.sh`, with the same search order as `rotation-check.sh` and the same precautions: the file is never sourced, and an installed copy that cannot be read stops the tool. The directories and the exclusions go through the same checks as in the backup.  
 The two scripts go together: a `tarsnap-backup.sh` from before `TARSNAP_PASSPHRASE` makes `tarsnap-diff.sh` stop with `variable TARSNAP_PASSPHRASE not found`.
 
 Its own configuration block, at the top of the file, only holds the binary paths, `LOG_DIR` and the installed path of `tarsnap-backup.sh`.
 
 No archive is touched.  
-Only `-tv` and `-x` are used, both read-only on the Tarsnap side: *"Extracting or listing archives may be performed in parallel with any other operation"*. With `TARSNAP_KEY` empty, a local `tarsnap --dump-config` comes first, to find the key.  
+Only `-tv` and `-x` are used, both read-only on the Tarsnap side: *"Extracting or listing archives may be performed in parallel with any other operation"*. A local `tarsnap --dump-config` comes first, to read the exclusions and the cache directory of `tarsnap.conf`, and its key when `TARSNAP_KEY` is empty.  
 The script therefore takes no lock, and you can call it while a backup is running.
 
 ### The four categories
@@ -707,12 +751,16 @@ Comparing two contents therefore requires fetching the one in the snapshot, whic
 
 Two different sizes imply two different contents: the case is settled for free, and it is by far the most frequent one.
 
-Two matching sets of metadata count as `=`, by a heuristic acknowledged as such. A file rewritten with exactly the same size, whose `mtime` was then reset to its original value, would slip through. It has to be done on purpose, and `--strict` is there for those who are not satisfied with that.
+The type is checked first: the same name with another type on each side, a file that became a directory or a symbolic link for instance, is `*` at once. The dates are compared in UTC on both sides: in local time, the hour repeated when the clocks go back would print two different instants the same.
+
+Two matching sets of metadata count as `=`, by a heuristic acknowledged as such. A file rewritten with exactly the same size, whose `mtime` was then reset to its original value, would slip through, and so would a file rewritten with the same size within the same second as the version of the snapshot, both sides counting in seconds. `--strict` is there for those who are not satisfied with that.
 
 That leaves the ambiguous case, the only one that justifies an actual read.  
 The file is downloaded, then compared byte by byte: this is what eliminates the false `*` of a file that was merely touched by a `touch`, a `sed -i` that changes nothing, a restore, and so on.
 
 All the files to download are fetched in **a single** Tarsnap invocation, rather than one per file.
+
+Only regular files go this way, and a hard link is downloaded along with the file it points to, then compared as the regular file it is. After the download, a copy that is not a regular file, or a file of the system that no longer is one, gets a `*` with a warning, `cmp` following symbolic links; so does a file that was not downloaded. When the extraction fails, a copy may be partial, and none is compared: every file to check is reported as `*`, which a warning and the header of the log explain.
 
 ### Strict mode
 
@@ -721,7 +769,7 @@ It is the only absolute guarantee, but it downloads the whole common part of the
 
 **Keep it for one-off checks, and certainly not for `cron`!!**
 
-The extraction is done in a temporary directory under `${TMPDIR:-/tmp}`. If `/tmp` does not have enough room, point `TMPDIR` elsewhere:
+The extraction is done in a temporary directory under `${TMPDIR:-/tmp}`. Since Debian 13, `/tmp` is a tmpfs, [held in memory](https://www.debian.org/releases/trixie/release-notes/issues.en.html#tmp-tmpfs) and allowed up to half of it by default: for a large `-S`, point `TMPDIR` to a disk:
 
 ```sh
 TMPDIR=/var/tmp ./tarsnap-diff.sh -S www-2026-08-27_00-02-02
@@ -762,7 +810,7 @@ Diff of foo-2026-07-27_00-02-05
 Details: /var/log/tarsnap-diff.sh-foo-2026-07-27_00-02-05.log
 ```
 
-The log carries the same figures at the top, in a header whose lines start with `#`: 11 lines, or 13 when neither `-i` nor `-m` was requested, which adds a note on the indicative counters. `grep '^#'` extracts it whatever the mode:
+The log carries the same figures at the top, in a header whose lines start with `#`: 11 lines, or 13 when neither `-i` nor `-m` was requested, which adds a note on the indicative counters, plus a line or two for each warning that applies: a failed extraction, the exclusions of `tarsnap.conf`, names left out, entries outside `BACKUP_DIRS`, errors of `find`. `grep '^#'` extracts it whatever the mode:
 
 ```
 root@foo:~/tarsnap-tools# grep '^#' /var/log/tarsnap-diff.sh-foo-2026-08-20_00-02-02.log
@@ -780,28 +828,28 @@ root@foo:~/tarsnap-tools# grep '^#' /var/log/tarsnap-diff.sh-foo-2026-08-20_00-0
 root@foo:~/tarsnap-tools#
 ```
 
-It is plain text, with no ANSI sequences: a file made to be grepped:
+It is plain text, with no ANSI sequences, and the control bytes of a name, ESC or CR for instance, are written as `?`, there as in the warnings: a file made to be grepped:
 
 ```sh
 grep '^\*' /var/log/tarsnap-diff.sh-foo-2026-07-27_00-02-05.log   # the modified files
 grep -c '^>' /var/log/tarsnap-diff.sh-foo-2026-07-27_00-02-05.log # how many new files
 ```
 
-The detail lines are written as they come, to a descriptor kept open, so you can follow the diff being built from another terminal:
+The detail lines are written as they come to a working file next to the log, whose name `-v` displays, so you can follow the diff being built from another terminal:
 
 ```sh
-tail -f /var/log/tarsnap-diff.sh-foo-2026-07-27_00-02-05.log
+tail -f /var/log/tarsnap-diff.sh-foo-2026-07-27_00-02-05.log.XXXXXXXX   # the name displayed by -v
 ```
 
 The header, of course, can only be written once the counters are known.  
-It is therefore prepended at the very end, by rewriting into a neighbouring file and then renaming it.  
-The operation is atomic, the log is never left truncated, but it changes the inode: a `tail -f` started during the run follows the old file, and will have to be restarted to see the header.
+It is therefore written at the very end into a second working file, followed by the details, and that file is renamed onto the log.  
+The operation is atomic, and until then nothing touches the log: a run that fails or is interrupted leaves the previous log of the same snapshot as it was. The working file of the details goes once the log is in place: the finished log is the file named in the summary.
 
 Do not put the log in a directory covered by `BACKUP_DIRS`: it would show up in its own diff as a new file.  
-The script warns you if you give it an absolute path that falls inside one.
+The script warns you when it falls inside one, its path being made canonical first, so that neither a relative path nor a symbolic link hides it.
 
-The log is created in mode 0600, under a random name next to its final path, then renamed onto it, and so is the working file of the header: a symbolic link planted beforehand under the name of the log, in `/tmp` for instance, is replaced rather than followed.  
-`-l` must name a file: a directory is refused with `log path is a directory`.
+Both working files are created by `mktemp`, in mode 0600, under random names next to the log, which keeps that mode once renamed: a file or a link planted beforehand, in `/tmp` for instance, can be neither followed nor reused.  
+Under the name of the log itself, only a regular file, or nothing yet, is accepted: a symbolic link, a device such as `/dev/null` or a named pipe is refused with `log path is not a regular file`, since the final rename would replace it with a regular file for every user of that name. `-l` must name a file: a directory is refused with `log path is a directory`.
 
 ### Progress display
 
@@ -823,13 +871,13 @@ usage: tarsnap-diff.sh [-d] [-n] [-i] [-m] [-S] [-v] [-e "patterns"]
 | `-m`, `--modified` | includes the modified files |
 | `-S`, `--strict` | compares **all** the common files byte by byte |
 | `-v`, `--verbose` | details the progress on standard error |
-| `-e`, `--exclude` | overrides `BACKUP_EXCLUDE` |
+| `-e`, `--exclude` | overrides `BACKUP_EXCLUDE`, `-e ""` for none |
 | `-l`, `--log` | path of the log |
 | `-f`, `--file` | path of `tarsnap-backup.sh` |
 | `--debug` | execution trace, and the temporary directory is kept |
 | `-h`, `--help` | displays the help |
 
-`SNAPSHOT` is the exact name of an existing archive, as listed by `tarsnap --list-archives`.
+`SNAPSHOT` is the exact name of an existing archive, as listed by `tarsnap --list-archives`. Without `-l`, it also names the log, and may only hold `A-Z`, `a-z`, `0-9`, `_`, `-` and `.`; with `-l`, any name is accepted, except one holding a `/` or a control character.
 
 A few examples:
 
@@ -845,19 +893,31 @@ A few examples:
 The exclusions in force when the snapshot was taken cannot be reconstructed: the script will necessarily apply today's...  
 If they have changed since, `-e` is precisely what lets you replay the old exclusions.
 
+`-e ""` replays a snapshot taken without any. The exclusions of `tarsnap.conf`, which `tarsnap -c` applied on top of `BACKUP_EXCLUDE`, still apply, on both sides: `-e` does not replace them, and the header of the log lists them. An `include` directive of `tarsnap.conf`, or one of its exclusions holding a blank, is not reproduced, and a warning says so.
+
 ### tarsnap-diff.sh limitations
 
 **Directories and symbolic links: only their presence is compared.**  
-If they exist on both sides, they are counted as `=`, with no notion of modification.
+If they exist on both sides, with the same type, they are counted as `=`, with no notion of modification.
 
 The listing does not provide what is needed to reliably judge a change of link target or of directory permissions.  
 Devices, sockets and named pipes are ignored, and have no business being in `BACKUP_DIRS`.
 
-**The system is alive during the walk:** two successive runs may differ by one without anything abnormal having happened: a temporary file created and then deleted between the two is enough.
+**The comparison is about content, not metadata:** a file whose permissions or owner alone have changed comes out as `=`.
+
+**The system is alive during the walk:** two successive runs may differ by one without anything abnormal having happened: a temporary file created and then deleted between the two is enough. A file that vanishes during the walk gives a warning, `find reported errors`, rather than stopping the diff, and the header of the log names the directories concerned.
+
+**The walk covers what `tarsnap -c` archives:** the cache directory of Tarsnap stays out, as Tarsnap leaves it out, and so do the working files of the script. Unless `tarsnap.conf` has `insane-filesystems`, a synthetic file system crossed during the walk, `/proc` for instance, is listed but not entered.
+
+**The `nodump` directive of `tarsnap.conf` is not reproduced:** a file flagged `nodump`, which `tarsnap -c` then skips, comes out as new.
+
+**Names holding a newline or a tab are left out,** on both sides, with everything below them, and counted: the inventories are lines of tab-separated fields, where such a name could forge or hide entries.
+
+**Entries outside the current `BACKUP_DIRS` are not reported as deleted:** those of a directory removed from `BACKUP_DIRS` since the snapshot are counted apart, with a warning.
+
+**A path stored twice in the archive** is judged on its last occurrence, the one that `tarsnap -x` restores.
 
 **GNU userland, like the rest of the suite:** `find -printf` and the `%T` extension of its formats.
-
-**The comparison is about content, not metadata:** a file whose permissions or owner alone have changed comes out as `=`.
 
 **Passphrase-protected key:** the script takes `TARSNAP_PASSPHRASE` from `tarsnap-backup.sh`, passes it to the listing and to the download, and applies the same checks before opening the log: a passphrase that cannot be obtained stops it at once, and the previous log of the same snapshot is kept.  
 With `env:` or `file:`, nothing is asked. With the default method or a `dev:` one, Tarsnap asks on the terminal, once for the listing and once more if files have to be downloaded: the download then runs without the progress spinner, leaving the messages of Tarsnap on the terminal, where the prompt stays visible.  
@@ -959,6 +1019,6 @@ The restored file therefore ends up in `$R/etc/fstab`, and the original is left 
 
 `CC0 1.0 Universal` -- Public Domain -- [LICENSE](LICENSE).
 
-`tarsnap-stats.sh`, which comes from [its own repository](https://github.com/deuza/tarsnap-stats), is released under the same license.
+`tarsnap-stats.sh`, developed here and also published in [its own repository](https://github.com/deuza/tarsnap-stats), is released under the same license.
 
 <p align="center">With ❤️ by <a href="https://github.com/deuza">DeuZa</a></p>
