@@ -18,13 +18,16 @@
 #   -h, --help             display the help
 #
 # The tarsnap man page forbids two concurrent create or delete operations
-# with the same key: the script therefore takes a lock of its own.
+# with the same key. The script takes a lock of its own, which keeps two
+# runs of this machine from overlapping. The lock is local to the host and
+# does not serialise two machines sharing a key: one key per machine.
 #
 
 # -e: exit on the first error
 # -u: an unset variable is an error
-# -f: no globbing on unquoted expansions ($BACKUP_DIRS, exclusion
-#     patterns).
+# -f: no pathname expansion at all, patterns written out in full included,
+#     not only on unquoted expansions ($BACKUP_DIRS, exclusion patterns).
+#     run_hook() turns it back on for the hooks.
 
 set -euf
 
@@ -55,7 +58,7 @@ FLOCK_BIN="/usr/bin/flock"
 CHMOD_BIN="/usr/bin/chmod"
 
 # --- Default behaviour, can be overridden by the options ---
-DRY=0            # 1 = full simulation, no archive is created or deleted
+DRY=0            # 1 = dry run: no archive is created or deleted
 VERBOSE=0        # 1 = detail each decision and pass -v to tarsnap
 SNAPSHOT_NAME="" # non-empty = named archive, outside the rotation
 ORPHANS=0        # 1 = list the archives outside the rotation, then exit
@@ -64,6 +67,12 @@ ORPHANS=0        # 1 = list the archives outside the rotation, then exit
 # Path of the Tarsnap private key.
 # Leave empty to rely on the keyfile declared in tarsnap.conf.
 # No whitespace allowed.
+#
+# The key must allow reading, writing and deleting, since the rotation
+# deletes: root on this machine can therefore delete every archive.
+# Keep a copy of the key, and of its passphrase if it has one, off this
+# machine: the archives cannot be read back without it, and the copy that
+# /root holds is itself archived encrypted with that very key.
 TARSNAP_KEY="/root/tarsnap.key"
 
 # Passphrase entry method for a protected key, passed to tarsnap as
@@ -72,12 +81,19 @@ TARSNAP_KEY="/root/tarsnap.key"
 #   dev:tty-stdin   /dev/tty, otherwise stdin (the default of tarsnap)
 #   dev:tty-once    /dev/tty only
 #   dev:stdin-once  stdin only
-#   env:NAME        environment variable NAME, which cron must provide;
-#                   pick a name of your own, not a variable of this script
+#   env:NAME        environment variable NAME; pick a name of your own,
+#                   not a variable of this script
 #   file:PATH       a single line, the passphrase; keep the file in 0600
 # Only env: and file: work without a terminal. On the command line, the
 # method takes precedence over a "passphrase" line of tarsnap.conf, which
 # tarsnap then silently ignores. No whitespace allowed.
+#
+# Under cron, prefer file:. Never define the variable of env: in a crontab:
+# cron writes the environment of the job, the variables of the crontab
+# included, into the X-Cron-Env headers of every mail it sends, and the
+# passphrase with them. If env: is required, export the variable from a
+# wrapper in mode 0700 that ends with
+# exec /usr/local/sbin/tarsnap-backup.sh "$@".
 TARSNAP_PASSPHRASE=""
 
 # Directories to back up, space-separated absolute paths. A trailing slash
@@ -128,7 +144,9 @@ DOM=1       # first day of the months, from 1 to 31
 # moved forward makes the purge delete about one archive per day of shift:
 # 7 lets a week of missed nights through, and stops a clock that jumped
 # more than about a week ahead, retention values cut by mistake, or a
-# reinstalled script whose retention went back to the defaults.
+# reinstalled script whose retention went back to the defaults. Nothing
+# else checks the clock: the script never compares it with the dates of
+# the archives.
 # Decimal integer from 1 to 99999, without a leading zero.
 MAX_PURGE=7
 
@@ -146,10 +164,13 @@ usage: ${0##*/} [-d|-n|--dry-run] [-v|--verbose] [-F|--force-purge]
        ${0##*/} [-o|--orphans]
        ${0##*/} [-h|--help]
 
-  -d, -n, --dry-run      full simulation: nothing is created or deleted,
-                         only the purge command is printed. The creation
-                         is simulated by tarsnap --dry-run, which reads the
-                         files, so it takes as long as a real run.
+  -d, -n, --dry-run      dry run: nothing is created or deleted, only the
+                         purge command is printed. The creation is
+                         simulated by tarsnap --dry-run, which reads the
+                         files, so it takes as long as a real run. Not
+                         checked: whether the cache directory is in sync
+                         with the server, whether the key may delete, and
+                         the environment of cron.
   -v, --verbose          detail the decision made for each archive
   -F, --force-purge      lift MAX_PURGE for this run only, once the purge
                          has been reviewed with --dry-run --verbose
@@ -272,6 +293,11 @@ postbackup() {
 #     would remove nothing.
 # set -e remains active in the subshell, and a failure in the hook stops
 # the script. The calls stay bare, never in a condition, see STEP 1.
+#
+# A run killed between the two hooks, by a signal or a reboot, does not run
+# postbackup: whatever prebackup left, the dumps for instance, stays in
+# place, private to root by the umask, until the next run goes through
+# both hooks again.
 run_hook() {
     (
         exec 9>&-
@@ -343,8 +369,9 @@ _END_OF_SECTION_
 #
 # The orphans: their name does not match the pattern
 # "hostname-YYYY-MM-DD_HH-MM-SS", so the purge does not even look at them.
-# Snapshots created with -s, archives made by hand, archives from another
-# machine sharing the same key, archives dating from a previous hostname.
+# Snapshots created with -s, archives made by hand, archives left by a
+# machine that used this key before, archives dating from a previous
+# hostname.
 #
 # The partials: suffixed .part, leftovers of an interrupted run. tarsnap(1)
 # gives two origins: an archive truncated on purpose, by ^Q, SIGQUIT or the
@@ -1047,6 +1074,12 @@ fi
 # created but some files could not be read (a file deleted during the
 # backup, a permission refused). The archive then exists: it is worth a
 # warning, neither a silent success nor an abort.
+#
+# A status 0 does not prove that every file was read either: a file that
+# tarsnap finds but then cannot open (deleted in the meantime, refused by
+# an NFS export) is left out of the archive with a message, and tarsnap
+# still exits with 0 (tar/write.c). Only that message tells; the script
+# does not parse the messages of tarsnap, whose format depends on -v.
 CREATE_RC=0
 # shellcheck disable=SC2086
 "$TARSNAP_BIN" $TARSNAP_KEYOPT $TARSNAP_MSGOPT -c -f "$NAME" "$@" \
