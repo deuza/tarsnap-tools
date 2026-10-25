@@ -535,6 +535,24 @@ conf_keyfile() {
     printf '%s\n' "$_ck_key"
 }
 
+# Prints the cache directory of tarsnap, read as conf_keyfile() reads the
+# key: the first "cachedir" line of the configuration files, in the output
+# of --dump-config. Returns 1 when there is none, or when the value cannot
+# be used as is (it starts with "~" or holds a blank). Same reading rule as
+# tarsnap-diff.sh, which reads it together with insane-filesystems: not a
+# shared function.
+conf_cachedir() {
+    _cc_dump=$("$TARSNAP_BIN" --dump-config 2>&1 >/dev/null) || return 1
+    _cc_dir=$(printf '%s\n' "$_cc_dump" | "$SED_BIN" -n \
+        -e '1,/^Reading from config file: /d' \
+        -e '/^  cachedir[[:space:]]/!d' \
+        -e 's/^  cachedir[[:space:]]*//p' -e 'q')
+    case "$_cc_dir" in
+        ""|"~"*|*[[:space:]]*) return 1 ;;
+    esac
+    printf '%s\n' "$_cc_dir"
+}
+
 # Retention values. Each one must be a decimal integer written without a
 # leading zero: the arithmetic of dash and bash reads "030" as octal, so
 # DAILY=030 silently kept 24 days of daily archives instead of 30 and
@@ -1102,6 +1120,15 @@ case "$CREATE_RC" in
         die "tarsnap -c failed (exit status $CREATE_RC), no rotation" ;;
 esac
 
+# What a dry run cannot tell, printed by every one of them: tarsnap
+# simulates the creation without writing anything to the server, hence
+# without checking its sequence number against the cache directory, and
+# the purge is only printed.
+if [ "$DRY" -eq 1 ]; then
+    printf 'Dry-run, not checked: the cache directory against the server,\n'
+    printf '  the right of the key to delete, the environment of cron.\n'
+fi
+
 # A snapshot is a one-off action: chaining three of them before going into
 # production must not trigger three purges.
 if [ -n "$SNAPSHOT_NAME" ]; then
@@ -1167,6 +1194,21 @@ ARCHIVES=$(printf '%s\n' "$ARCHIVES" | LC_ALL=C "$SORT_BIN")
 if [ "$CREATE_RC" -eq 2 ] && [ "$DRY" -eq 0 ] &&
     ! printf '%s\n' "$ARCHIVES" | "$GREP_BIN" -Fqx -- "$NAME"; then
     die "archive $NAME not listed after an exit status 2, no rotation"
+fi
+
+# The local state of tarsnap is the file "directory" of its cache
+# directory. After a reinstall, a rollback or a cache directory restored
+# from elsewhere, it is missing or out of date: tarsnap refuses to delete
+# without it (tar/bsdtar.c:1001-1012), and only tarsnap --fsck rebuilds it.
+# A dry run does not notice, since tarsnap reads no state for a simulated
+# creation: the file is looked for here. Only when the account holds
+# archives, a new key starting with an empty cache directory.
+if [ "$DRY" -eq 1 ] && [ -n "$ARCHIVES" ] &&
+    CACHE_DIR=$(conf_cachedir) && [ ! -e "$CACHE_DIR/directory" ]; then
+    printf 'WARNING: %s/directory is missing while the account\n' \
+        "$CACHE_DIR" >&2
+    printf '  holds archives: tarsnap needs it to delete and to keep\n' >&2
+    printf '  in step with the server. Run tarsnap --fsck first.\n' >&2
 fi
 
 # Start again from an empty set of positional parameters: it will serve as
