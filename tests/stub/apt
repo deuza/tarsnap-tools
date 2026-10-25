@@ -1,0 +1,17 @@
+#!/bin/sh
+#
+# tests/stub/apt: answers "list --installed" as apt does, the warning about
+# its unstable interface included. With apt.rc in the state directory, see
+# tests/stub/tarsnap, it fails instead, with that exit status and the
+# message of apt.err on standard error.
+
+set -eu
+S=${STUB_STATE_DIR:?STUB_STATE_DIR is not set}
+if [ -f "$S/apt.rc" ]; then
+    [ ! -f "$S/apt.err" ] || cat "$S/apt.err" >&2
+    read -r rc < "$S/apt.rc"
+    exit "$rc"
+fi
+printf '\nWARNING: apt does not have a stable CLI interface. Use with caution in scripts.\n\n' >&2
+printf 'Listing...\n'
+printf 'base-files/stable,now 13.8 amd64 [installed]\n'

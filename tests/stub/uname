@@ -1,0 +1,7 @@
+#!/bin/sh
+#
+# tests/stub/uname: the host name of the tests, read from the state
+# directory of the stubs, see tests/stub/tarsnap. Any option prints it.
+
+set -eu
+cat "${STUB_STATE_DIR:?STUB_STATE_DIR is not set}/hostname"

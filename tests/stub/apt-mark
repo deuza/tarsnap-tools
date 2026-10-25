@@ -1,0 +1,15 @@
+#!/bin/sh
+#
+# tests/stub/apt-mark: answers "showmanual" with a fixed line. With
+# apt-mark.rc in the state directory, see tests/stub/tarsnap, it fails
+# instead, with that exit status and the message of apt-mark.err on
+# standard error.
+
+set -eu
+S=${STUB_STATE_DIR:?STUB_STATE_DIR is not set}
+if [ -f "$S/apt-mark.rc" ]; then
+    [ ! -f "$S/apt-mark.err" ] || cat "$S/apt-mark.err" >&2
+    read -r rc < "$S/apt-mark.rc"
+    exit "$rc"
+fi
+printf 'base-files\n'

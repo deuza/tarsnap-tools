@@ -1,0 +1,306 @@
+#!/bin/sh
+#
+# tests/stub/tarsnap
+#
+# A fake tarsnap for the regression tests: no network, no account, no key.
+# It keeps the state of the account, and the log of its calls, in the
+# directory named by STUB_STATE_DIR, which the case prepares:
+#
+#   archives          the archives of the account, one per line, as
+#                     --list-archives prints them; -c adds to it, -d removes
+#   listing/NAME      the output of -tv for the archive NAME, verbatim
+#   store/NAME/       the files of the archive NAME, under their path without
+#                     its leading /, and store/NAME.roots, the directories it
+#                     archived, one per line, relative: -tv is generated from
+#                     them when listing/NAME does not exist, -x extracts from
+#                     them
+#   dump              what --dump-config prints on standard error
+#   stats             what --print-stats prints
+#   MODE.rc           exit status of a mode: c, d, list, tv, x, dump, stats,
+#                     verify
+#   c.noadd           with an exit status of 2 for -c, the archive is not
+#                     written either
+#   at.MODE, go.MODE  FIFOs: when they exist, the stub writes the PID of its
+#                     parent to at.MODE, then waits for a line on go.MODE, so
+#                     that a case can act at a known point of a run: before
+#                     -c, -d and -x do anything, after --list-archives and
+#                     -tv have printed their output
+#
+# Every call is numbered: call.N holds its arguments, one per line, and the
+# file "calls" one line "N MODE" per call. The arguments of -T are kept in
+# call.N.T, and the names extracted by -x in call.N.x.
+#
+# What it reproduces of tarsnap 1.0.41: an archive name already taken is
+# refused (tapepresent(), tar/multitape/multitape_write.c), -d stops at the
+# first archive that does not exist, an unreadable --keyfile is refused,
+# -tv prints the names escaped as bsdtar_expand_char() of tar/util.c does,
+# directories with a trailing / and hard links as type h with a size of 0,
+# and -x reads each line of -T as a pattern, matched like fnmatch(3) without
+# FNM_PATHNAME and with FNM_LEADING_DIR, through find -path. Names holding a
+# newline or a tab need a listing written by hand.
+
+set -eu
+
+S=${STUB_STATE_DIR:?STUB_STATE_DIR is not set}
+LC_ALL=C
+export LC_ALL
+
+n=0
+if [ -f "$S/n" ]; then
+    read -r n < "$S/n"
+fi
+n=$((n + 1))
+printf '%s\n' "$n" > "$S/n"
+: > "$S/call.$n"
+for a do
+    printf '%s\n' "$a" >> "$S/call.$n"
+done
+
+mode=""
+dry=0
+keyfile=""
+dir=""
+tlist=""
+fl="$S/call.$n.f"
+: > "$fl"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -c) mode=c ;;
+        -d) mode=d ;;
+        -x) mode=x ;;
+        -t|-tv|-vt) mode=tv ;;
+        --list-archives) mode=list ;;
+        --print-stats) mode=stats ;;
+        --verify-config) mode=verify ;;
+        --dump-config) mode=dump ;;
+        --fsck|--fsck-prune) mode=fsck ;;
+        --dry-run) dry=1 ;;
+        -f) shift; printf '%s\n' "$1" >> "$fl" ;;
+        -C) shift; dir=$1 ;;
+        -T) shift; tlist=$1 ;;
+        --keyfile) shift; keyfile=$1 ;;
+        --passphrase|--cachedir|--configfile|--maxbw|--creationtime) shift ;;
+        *) ;;
+    esac
+    shift
+done
+printf '%s %s\n' "$n" "${mode:-none}" >> "$S/calls"
+
+# Exit status configured for a mode, 0 by default.
+rc_of() {
+    if [ -f "$S/$1.rc" ]; then
+        read -r _rc < "$S/$1.rc"
+        printf '%s\n' "$_rc"
+    else
+        printf '0\n'
+    fi
+}
+
+# Rendezvous with the case, see at.MODE and go.MODE above.
+hold() {
+    if [ -p "$S/at.$1" ]; then
+        printf '%s\n' "$PPID" > "$S/at.$1"
+    fi
+    if [ -p "$S/go.$1" ]; then
+        read -r _go < "$S/go.$1" || :
+    fi
+}
+
+[ -f "$S/archives" ] || : > "$S/archives"
+
+case "$mode" in
+    c|d|tv|x|list|stats)
+        if [ -n "$keyfile" ] && [ ! -r "$keyfile" ]; then
+            printf 'tarsnap: Cannot read key file: %s\n' "$keyfile" >&2
+            exit 1
+        fi
+        ;;
+esac
+
+# The -tv listing of an archive, generated from its store: permissions, link
+# count, numeric owner and group, size, ISO date and time in the TZ of the
+# caller, name.
+gen_listing() {
+    (
+        cd "$S/store/$1"
+        while IFS= read -r root; do
+            find "$root" -printf \
+                '%i\t%n\t%M\t%U\t%G\t%s\t%TY-%Tm-%Td %TH:%TM:%TS\t%y\t%p\t%l\n'
+        done < "$S/store/$1.roots"
+    ) | awk -F '\t' '
+        BEGIN { for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i }
+        function esc(s,    out, i, c, o) {
+            out = ""
+            for (i = 1; i <= length(s); i++) {
+                c = substr(s, i, 1)
+                o = ord[c]
+                if (c == "\\") out = out "\\\\"
+                else if (o == 7) out = out "\\a"
+                else if (o == 8) out = out "\\b"
+                else if (o == 9) out = out "\\t"
+                else if (o == 10) out = out "\\n"
+                else if (o == 11) out = out "\\v"
+                else if (o == 12) out = out "\\f"
+                else if (o == 13) out = out "\\r"
+                else if (o < 32 || o == 127) out = out sprintf("\\%03o", o)
+                else out = out c
+            }
+            return out
+        }
+        {
+            mode = $3; size = $6; stamp = $7; name = esc($9)
+            sub(/\.[0-9]*$/, "", stamp)
+            if ($8 == "d") {
+                name = name "/"
+            } else if ($8 == "l") {
+                name = name " -> " esc($10)
+                size = 0
+            } else if ($8 == "f" && $2 > 1) {
+                if ($1 in first) {
+                    mode = "h" substr(mode, 2)
+                    name = name " link to " esc(first[$1])
+                    size = 0
+                } else {
+                    first[$1] = $9
+                }
+            }
+            printf "%s %d %-8s %-8s %8s %s %s\n", mode, $2, $4, $5, size, stamp, name
+        }'
+}
+
+case "$mode" in
+    list)
+        rc=$(rc_of list)
+        if [ "$rc" -ne 0 ]; then
+            printf 'tarsnap: simulated failure of --list-archives\n' >&2
+            exit "$rc"
+        fi
+        cat "$S/archives"
+        hold list
+        ;;
+    c)
+        name=$(sed -n 1p "$fl")
+        hold c
+        rc=$(rc_of c)
+        if [ "$dry" -eq 0 ]; then
+            if grep -qxF -- "$name" "$S/archives"; then
+                printf 'tarsnap: An archive already exists with the name "%s"\n' \
+                    "$name" >&2
+                exit 1
+            fi
+            if [ "$rc" -eq 0 ] || { [ "$rc" -eq 2 ] && [ ! -f "$S/c.noadd" ]; }; then
+                printf '%s\n' "$name" >> "$S/archives"
+            fi
+        fi
+        if [ "$rc" -ne 0 ]; then
+            printf 'tarsnap: simulated exit status %s of -c\n' "$rc" >&2
+        fi
+        exit "$rc"
+        ;;
+    d)
+        hold d
+        rc=$(rc_of d)
+        if [ "$rc" -ne 0 ]; then
+            printf 'tarsnap: The delete authorization key is required for -d but is not available\n' >&2
+            exit "$rc"
+        fi
+        while IFS= read -r name; do
+            if ! grep -qxF -- "$name" "$S/archives"; then
+                printf 'tarsnap: Archive does not exist: %s\n' "$name" >&2
+                exit 1
+            fi
+            grep -vxF -- "$name" "$S/archives" > "$S/archives.new" || :
+            mv "$S/archives.new" "$S/archives"
+        done < "$fl"
+        ;;
+    tv)
+        snap=$(sed -n 1p "$fl")
+        rc=$(rc_of tv)
+        if [ "$rc" -ne 0 ]; then
+            hold tv
+            printf 'tarsnap: simulated failure of -tv\n' >&2
+            exit "$rc"
+        fi
+        if [ -f "$S/listing/$snap" ]; then
+            cat "$S/listing/$snap"
+        elif [ -f "$S/store/$snap.roots" ]; then
+            gen_listing "$snap"
+        else
+            printf 'tarsnap: Archive does not exist: %s\n' "$snap" >&2
+            exit 1
+        fi
+        hold tv
+        ;;
+    x)
+        snap=$(sed -n 1p "$fl")
+        [ -z "$tlist" ] || cp "$tlist" "$S/call.$n.T"
+        : > "$S/call.$n.x"
+        hold x
+        if [ ! -f "$S/store/$snap.roots" ]; then
+            printf 'tarsnap: Archive does not exist: %s\n' "$snap" >&2
+            exit 1
+        fi
+        notfound=0
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            (
+                cd "$S/store/$snap"
+                while IFS= read -r root; do
+                    find "$root" \( -path "$p" -o -path "$p/*" \) -print
+                done < "$S/store/$snap.roots"
+            ) > "$S/call.$n.m"
+            if [ ! -s "$S/call.$n.m" ]; then
+                printf 'tarsnap: %s: Not found in archive\n' "$p" >&2
+                notfound=1
+                continue
+            fi
+            while IFS= read -r e; do
+                if [ -d "$S/store/$snap/$e" ] && [ ! -h "$S/store/$snap/$e" ]; then
+                    mkdir -p "$dir/$e"
+                else
+                    mkdir -p "$dir/${e%/*}"
+                    cp -P "$S/store/$snap/$e" "$dir/$e"
+                fi
+                printf '%s\n' "$e" >> "$S/call.$n.x"
+            done < "$S/call.$n.m"
+        done < "$tlist"
+        rc=$(rc_of x)
+        if [ "$rc" -eq 0 ] && [ "$notfound" -eq 1 ]; then
+            rc=1
+        fi
+        exit "$rc"
+        ;;
+    stats)
+        rc=$(rc_of stats)
+        if [ "$rc" -ne 0 ]; then
+            printf 'tarsnap: simulated failure of --print-stats\n' >&2
+            exit "$rc"
+        fi
+        if [ -f "$S/stats" ]; then
+            cat "$S/stats"
+        else
+            printf '%-32s%20s%20s\n' '' 'Total size' 'Compressed size'
+            printf '%-32s%20s%20s\n' 'All archives' 10000000000 5000000000
+            printf '%-32s%20s%20s\n' '  (unique data)' 2000000000 1000000000
+        fi
+        ;;
+    verify)
+        exit "$(rc_of verify)"
+        ;;
+    dump)
+        if [ -f "$S/dump" ]; then
+            cat "$S/dump" >&2
+        else
+            printf 'tarsnap --dump-config\n' >&2
+            printf 'Reading from config file: %s/tarsnap.conf\n' "$S" >&2
+        fi
+        exit "$(rc_of dump)"
+        ;;
+    fsck)
+        ;;
+    *)
+        printf 'tarsnap: no mode given to the stub\n' >&2
+        exit 1
+        ;;
+esac
+exit 0

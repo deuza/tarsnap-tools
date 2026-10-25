@@ -1,0 +1,5 @@
+# ShellCheck settings for the files of tests/ only.
+#
+# The cases call the helpers of lib.sh, run_backup and the like, without
+# arguments on purpose: SC2119 would have them pass "$@" along.
+disable=SC2119

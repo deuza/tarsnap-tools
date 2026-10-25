@@ -1,0 +1,6 @@
+#!/bin/sh
+#
+# tests/stub/dpkg: answers --get-selections with a fixed line.
+
+set -eu
+printf 'base-files\t\t\t\t\t\tinstall\n'
