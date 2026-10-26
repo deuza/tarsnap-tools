@@ -31,8 +31,9 @@
 #     created or deleted.
 #   - --print-stats reads the cache directory while a scheduled backup may be
 #     writing to it, which can yield an inconsistent snapshot.
-#   - a passphrase-protected key file cannot be unlocked without a terminal,
-#     so the script simply fails under cron.
+#   - a passphrase-protected key file can only be unlocked without a terminal
+#     through -p file:PATH or -p env:VAR, with tarsnap 1.0.40 or later;
+#     otherwise the script simply fails under cron.
 #   - with -k pointing at another machine's key, the snapshot count comes
 #     from that machine and the sizes from this one (see "Key file" above),
 #     and nobody reads the figures of an unattended run to notice the mix.
@@ -178,7 +179,8 @@ fi
 
 # "tarsnap --verify-config" validates the configuration syntax, it does not
 # look at the key file at all, so check it here to fail with a useful message
-# rather than with tarsnap's "Cannot read key file" three calls later.
+# rather than with tarsnap's "Cannot read key file" on the next call,
+# --list-archives, which ends the run with status 4.
 if [ -n "$KEYFILE" ] && [ ! -r "$KEYFILE" ]; then
     printf '%s: key file not readable: %s\n' "$0" "$KEYFILE" >&2
     exit 8
@@ -348,6 +350,10 @@ if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
         "$rc" >&2
     exit 9
 fi
+# A tarsnap older than 1.0.37, which does not know --verify-config, or older
+# than 1.0.40 when -p adds --passphrase, also exits with 1 here, and is
+# reported below as a rejected configuration, status 3. The README of
+# deuza/tarsnap-stats gives the minimal versions.
 if [ "$rc" -ne 0 ]; then
     printf '%s: "tarsnap --verify-config" rejected the configuration\n' \
         "$0" >&2
