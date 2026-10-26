@@ -482,7 +482,7 @@ usage: tarsnap-backup.sh [-d|-n|--dry-run] [-v|--verbose] [-F|--force-purge]
        tarsnap-backup.sh [-h|--help]
 ```
 
-`-d`, `-n`, `--dry-run`: full simulation. Nothing is created or deleted, and the purge command that would be executed is displayed, with a warning when it would exceed `MAX_PURGE`.  
+`-d`, `-n`, `--dry-run`: dry run. Nothing is created or deleted, and the purge command that would be executed is displayed, with a warning when it would exceed `MAX_PURGE`.  
 Beware: the creation is simulated by `tarsnap --dry-run`, which really reads the files: it takes as long as a real run.  
 The faster `--dry-run-metadata` of Tarsnap 1.0.41 is deliberately not used: see [HACKING.md](HACKING.md#the---dry-run-metadata-bug).
 

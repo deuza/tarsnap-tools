@@ -6,13 +6,15 @@
 # from magnetic tape rotation, reimplemented here in POSIX sh.
 #
 # Deliberate order: the new archive is created BEFORE anything is destroyed.
-# If tarsnap fails (network, quota, key), set -e aborts the script and no
-# archive is deleted. The worst case is therefore "old archives pile up",
-# never the behaviour: "I purged and I have nothing new".
+# If tarsnap -c fails (network, quota, key), the script runs postbackup,
+# then stops before the rotation, and no archive is deleted. The worst case
+# is therefore "old archives pile up", never the behaviour: "I purged and I
+# have nothing new".
 #
 # Options:
 #   -n, -d, --dry-run      create no archive and delete nothing
 #   -v, --verbose          detail the decision made for each archive
+#   -F, --force-purge      lift MAX_PURGE for this run only
 #   -s, --snapshot-name N  create a named archive, outside the rotation
 #   -o, --orphans          list the archives beyond the reach of the rotation
 #   -h, --help             display the help
@@ -153,13 +155,15 @@ DOM=1       # first day of the months, from 1 to 31
 # Most archives a single run may delete. Past it, the run deletes nothing,
 # keeps the archive it has just created, and stops with an error, hence a
 # cron mail: review with --dry-run --verbose, then rerun once with
-# --force-purge. In steady state a run deletes 0 or 1 archive, and a clock
-# moved forward makes the purge delete about one archive per day of shift:
-# 7 lets a week of missed nights through, and stops a clock that jumped
-# more than about a week ahead, retention values cut by mistake, or a
-# reinstalled script whose retention went back to the defaults. Besides,
-# the rotation warns without stopping when the newest archive is dated
-# after today, or is two days old or more, as rotation-check.sh does.
+# --force-purge. In steady state a run deletes 0 or 1 archive, 2 on the rare
+# night when a grandfather leaves the monthly window as a son leaves the
+# daily one, and a clock moved forward makes the purge delete about one
+# archive per day of shift: 7 lets a week of missed nights through, and
+# stops a clock that jumped more than about a week ahead, retention values
+# cut by mistake, or a reinstalled script whose retention went back to the
+# defaults. Besides, the rotation warns without stopping when the newest
+# archive is dated after today, or is two days old or more, as
+# rotation-check.sh does.
 # Decimal integer from 1 to 99999, without a leading zero.
 MAX_PURGE=7
 

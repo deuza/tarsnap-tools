@@ -89,8 +89,8 @@ $_pad [-b count]
   -d DAILY    override the daily window, in days
   -w WEEKLY   override the weekly window, in weeks
   -m MONTHLY  override the monthly window, in months
-  -o DOW      override the day of the week kept, 0=Sunday
-  -M DOM      override the day of the month kept
+  -o DOW      override the first day of the weeks, 0=Sunday
+  -M DOM      override the first day of the months
   -b count    override MAX_PURGE, the most archives a run may delete
   -l file     replay against a real list of archives, "-" for stdin
   -H host     host of the replayed archives, instead of this machine
