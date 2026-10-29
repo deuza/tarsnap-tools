@@ -133,9 +133,10 @@ PKG_SELECTIONS="/root/pkg-selections.txt"
 PKG_LIST="/root/pkg-list.txt"
 PKG_MANUAL="/root/pkg-manual.txt"
 
-# Name of the archive of the last real run that created one, rewritten at
-# the end of such a run, see log_exit(). Its age, checked apart from the
-# runs (by cron, a monitoring or by hand), tells that the backups stopped.
+# Name of the archive of the last real run that ended with status 0 or 2,
+# written by log_exit(): a run stopped later, at the purge circuit breaker
+# for instance, leaves it as it was. Its age, checked apart from the runs
+# (by cron, a monitoring or by hand), tells that the backups stopped.
 LAST_SUCCESS="/root/tarsnap-backup.last-success"
 
 # --- Retention: grandfather / father / son scheme ---
@@ -235,8 +236,9 @@ die() {
 #
 # set -e only stops the script on a command that fails on a line of its
 # own. A failure goes unnoticed in a pipeline, except in its last command
-# (dash has no pipefail), on the left of && or ||, and in the condition of
-# an if or a while: one command per line, and test what has to be tested.
+# (the script not setting pipefail), on the left of && or ||, and in the
+# condition of an if or a while: one command per line, and test what has
+# to be tested.
 #
 # Both hooks run in a subshell, see run_hook(): a variable they set does
 # not reach the rest of the script.

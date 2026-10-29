@@ -88,9 +88,9 @@
 #     as "cmd || rc=$?", which is exempt from -e.
 # -u: a typo in a variable name becomes a hard error instead of an empty
 #     string silently propagating into the output.
-# "pipefail" is deliberately NOT used: it is not POSIX (dash rejects it, and
-#     /bin/sh is dash on Debian), and nothing here relies on the exit status
-#     of a pipeline anyway.
+# "pipefail" is deliberately NOT used: dash only knows it from 0.5.13, Debian
+#     13 shipping 0.5.12, and nothing here relies on the exit status of a
+#     pipeline anyway.
 set -eu
 
 # Force '.' as the decimal separator regardless of the machine locale:

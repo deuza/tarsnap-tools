@@ -124,8 +124,8 @@
 
 # -e: exit on the first error
 # -u: an unset variable is an error
-# -f: no globbing on unquoted expansions (BACKUP_DIRS, exclusion
-#     patterns)
+# -f: no pathname expansion at all, patterns written out in full included,
+#     not only on unquoted expansions ($BACKUP_DIRS, exclusion patterns).
 set -euf
 
 #################
@@ -1367,6 +1367,9 @@ for dir in $BACKUP_DIRS; do
             || _start_fs=""
         set -- "$@" \(
         _first=1
+        # Kernel names, as find reads them from the mount table: tarsnap,
+        # which goes by the statfs magic, calls selinuxfs "selinux" and
+        # usbfs "usbdevfs".
         for _fs in proc sysfs devpts securityfs selinuxfs usbfs devfs; do
             [ "$_fs" != "$_start_fs" ] || continue
             if [ "$_first" -eq 1 ]; then
